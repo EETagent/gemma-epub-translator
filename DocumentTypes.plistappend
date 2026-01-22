@@ -1,0 +1,22 @@
+
+	<key>CFBundleDocumentTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeExtensions</key>
+			<array>
+				<string>epub</string>
+			</array>
+			<key>CFBundleTypeIconFile</key>
+			<string>book.icns</string>
+			<key>CFBundleTypeName</key>
+			<string>E-book</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+		</dict>
+	</array>
+	<key>LSRequiresNativeExecution</key>
+	<true/>
+	<key>NSAppleScriptEnabled</key>
+	<false/>
+	<key>NSHighResolutionCapable</key>
+	<true/>

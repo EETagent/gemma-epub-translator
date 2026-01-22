@@ -1,0 +1,25 @@
+[package]
+name = "gemma-translator"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+cacao = { version = "^0.4.0-beta2", features = ["appkit", "autolayout"] } # Verze s dobrou podporou AppKit
+epub = "^2.1"
+llama-cpp-2 = { version = "0.1.132", features = ["metal"] }
+tokio = { version = "1", features = ["full"] }
+image = "^0.25"
+lol_html = "^1.2"
+zip = "^0.6"
+objc = "0.2.7"
+
+[package.metadata.bundle]
+name = "Gemma EPUB Translator"
+identifier = "com.github.EETagent.gemma-translator"
+version = "0.1.0"
+copyright = "2026, EETagent"
+category = "public.app-category.productivity"
+short_description = "Translate EPUB files using Gemma"
+resources = ["models/translategemma-12b-it.Q4_K_M.gguf"]
+entitlements = "entitlements.plist"
+osx_info_plist_exts = ["DocumentTypes.plistappend"]

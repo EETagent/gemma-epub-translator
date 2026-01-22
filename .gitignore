@@ -1,0 +1,4 @@
+/target
+/old*
+/models/*.gguf
+.DS_Store
