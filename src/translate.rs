@@ -20,7 +20,7 @@ const MAX_SEQ_BATCH: usize = 8;
 
 const PROMPT_TEMPLATE: &str = "<bos><start_of_turn>user\nYou are a professional {SOURCE_LANG} ({SOURCE_CODE}) to {TARGET_LANG} ({TARGET_CODE}) translator. Your goal is to accurately convey the meaning and nuances of the original {SOURCE_LANG} text while adhering to {TARGET_LANG} grammar, vocabulary, and cultural sensitivities.\nProduce only the {TARGET_LANG} translation, without any additional explanations or commentary. Please translate the following {SOURCE_LANG} text into {TARGET_LANG}:\n\n\n{TEXT}<end_of_turn>\n<start_of_turn>model\n";
 
-static MODEL_STATE: OnceLock<Arc<Mutex<LlamaState>>> = OnceLock::new();
+static mut MODEL_STATE: OnceLock<Arc<Mutex<LlamaState>>> = OnceLock::new();
 
 struct LlamaState {
     #[allow(dead_code)]
@@ -34,6 +34,12 @@ unsafe impl Send for LlamaState {}
 
 pub fn init_model() {
     let _ = get_model_state();
+}
+
+pub fn shutdown_model() {
+    unsafe {
+        MODEL_STATE.take().unwrap();
+    }
 }
 
 pub fn translate_text(text: &str, source_locale: &str, target_locale: &str) -> String {
@@ -167,13 +173,15 @@ pub fn prompt_token_count(text: &str, source_locale: &str, target_locale: &str) 
 }
 
 pub fn is_model_ready() -> bool {
-    MODEL_STATE.get().is_some()
+    unsafe { MODEL_STATE.get().is_some() }
 }
 
 fn get_model_state() -> Arc<Mutex<LlamaState>> {
-    MODEL_STATE
-        .get_or_init(|| Arc::new(Mutex::new(init_state())))
-        .clone()
+    unsafe {
+        MODEL_STATE
+            .get_or_init(|| Arc::new(Mutex::new(init_state())))
+            .clone()
+    }
 }
 
 fn run_batch_inference(

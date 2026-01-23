@@ -14,7 +14,7 @@ fn main() {
     }
 
     use cacao::appkit::App;
-    App::new("com.github.EETagent.gemma-translator", ui::TranslatorApp::new()).run();
+    App::new("com.github.EETagent.gemma-translator", ui::app::TranslatorApp::new()).run();
 }
 
 fn run_cli_test(args: &[String]) {

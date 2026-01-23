@@ -20,10 +20,7 @@ use crate::ui::epub_view::EpubView;
 pub enum AppMessage {
     ShowOpenPanel,
     OpenFile(PathBuf),
-    TranslationProgress {
-        completed: usize,
-        total: usize,
-    },
+    TranslationProgress { completed: usize, total: usize },
     TranslationComplete(Result<PathBuf, String>),
     CancelTranslation,
 }
