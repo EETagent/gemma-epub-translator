@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-cacao = { version = "^0.4.0-beta2", features = ["appkit", "autolayout"] } # Verze s dobrou podporou AppKit
+cacao = {  git = "https://github.com/orionlize/cacao", branch = "trunk", features = ["appkit", "autolayout"] } # Verze s dobrou podporou AppKit
 epub = "^2.1"
 llama-cpp-2 = { version = "0.1.132", features = ["metal"] }
 tokio = { version = "1", features = ["full"] }
