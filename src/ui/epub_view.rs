@@ -7,13 +7,13 @@ use cacao::foundation::NSURL;
 use cacao::image::{Image, ImageView};
 use cacao::layout::Layout;
 use cacao::layout::LayoutConstraint;
+use cacao::objc_access::ObjcAccess;
 use cacao::pasteboard::PasteboardType;
 use cacao::progress::ProgressIndicator;
 use cacao::select::Select;
 use cacao::text::{Font, Label, TextAlign};
 use cacao::url::Url;
 use cacao::view::{View, ViewDelegate};
-use cacao::objc_access::ObjcAccess;
 use epub::doc::EpubDoc;
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -88,6 +88,19 @@ impl ContentView {
     }
 }
 
+const SOURCE_LANGUAGES: &[(&str, &str)] = &[
+    ("US English", "en-US"),
+    ("UK English", "en-GB"),
+    ("German", "de"),
+    ("Slovak", "sk"),
+    ("Spanish", "es"),
+    ("Russian", "ru"),
+    ("Danish", "da"),
+    ("Czech", "cs"),
+];
+
+const TARGET_LANGUAGES: &[(&str, &str)] = &[("Czech", "cs"), ("English", "en-US")];
+
 impl ViewDelegate for ContentView {
     const NAME: &'static str = "EpubViewContent";
 
@@ -105,18 +118,14 @@ impl ViewDelegate for ContentView {
         ui.label_title.set_font(Font::bold_system(18.0));
         ui.label_title.set_text_color(Color::Label);
 
-        ui.source_lang_select.add_item("US English (en-US)");
-        ui.source_lang_select.add_item("UK English (en-GB)");
-        ui.source_lang_select.add_item("Czech (cs)");
-        ui.source_lang_select.add_item("Spanish (es)");
-        ui.source_lang_select.add_item("Russian (ru)");
-        ui.source_lang_select.add_item("German (de)");
-        ui.source_lang_select.add_item("Danish (da)");
-
+        for &(lang_name, _lang_code) in SOURCE_LANGUAGES {
+            ui.source_lang_select.add_item(lang_name);
+        }
         ui.source_lang_select.set_selected_index(0);
 
-        ui.lang_select.add_item("Czech (cs)");
-        ui.lang_select.add_item("English (en-US)");
+        for &(lang_name, _lang_code) in TARGET_LANGUAGES {
+            ui.lang_select.add_item(lang_name);
+        }
         ui.lang_select.set_selected_index(0);
 
         ui.btn_open.set_bezel_style(BezelStyle::Rounded);
@@ -485,21 +494,16 @@ impl EpubView {
 
         let (source_locale, target_locale) = {
             let ui = self.ui.borrow();
-            let source = match ui.source_lang_select.get_selected_index() {
-                0 => "en-US",
-                1 => "en-GB",
-                2 => "cs",
-                3 => "es",
-                4 => "ru",
-                5 => "de",
-                6 => "da",
-                _ => "en-US",
-            };
-            let target = match ui.lang_select.get_selected_index() {
-                0 => "cs",
-                1 => "en-US",
-                _ => "cs",
-            };
+            let source = SOURCE_LANGUAGES
+                .get(ui.source_lang_select.get_selected_index())
+                .map(|&(_, code)| code)
+                .unwrap_or("en-US");
+
+            let target = TARGET_LANGUAGES
+                .get(ui.lang_select.get_selected_index())
+                .map(|&(_, code)| code)
+                .unwrap_or("cs");
+
             (source.to_string(), target.to_string())
         };
 
