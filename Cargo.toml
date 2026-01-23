@@ -7,11 +7,9 @@ edition = "2021"
 cacao = {  git = "https://github.com/orionlize/cacao", branch = "trunk", features = ["appkit", "autolayout"] } # Verze s dobrou podporou AppKit
 epub = "^2.1"
 llama-cpp-2 = { version = "0.1.132", features = ["metal"] }
-tokio = { version = "1", features = ["full"] }
 image = "^0.25"
 lol_html = "^1.2"
 zip = "^0.6"
-objc = "0.2.7"
 
 [package.metadata.bundle]
 name = "Gemma EPUB Translator"
