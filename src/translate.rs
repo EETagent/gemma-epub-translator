@@ -17,6 +17,8 @@ const MODEL_FILE: &str = "translategemma-12b-it.Q4_K_M.gguf";
 const CTX_SIZE: u32 = 2048 * 4;
 const N_BATCH: u32 = 2048 * 4;
 const MAX_OUTPUT_TOKENS: usize = 512 * 4;
+const SHORT_OUTPUT_TOKENS: usize = 16;
+const SHORT_INPUT_TOKENS: usize = 4;
 const MAX_SEQ_BATCH: usize = 8;
 const STOP_SEQUENCE: &str = "<end_of_turn>";
 const TOP_K: i32 = 64;
@@ -70,6 +72,8 @@ pub struct BatchLimits {
 struct PromptKey {
     parent_index: usize,
     chunk_index: usize,
+    is_short_input: bool,
+    is_single_word: bool,
 }
 
 pub fn translate_texts(texts: &[String], source_locale: &str, target_locale: &str) -> Vec<String> {
@@ -103,10 +107,14 @@ pub fn translate_texts(texts: &[String], source_locale: &str, target_locale: &st
         chunk_results[index] = vec![None; chunks.len()];
         for (chunk_index, chunk_text) in chunks.into_iter().enumerate() {
             let prompt = build_prompt(&chunk_text, source_locale, target_locale);
+            let is_short_input = is_short_input_text(&chunk_text, &state);
+            let is_single_word = is_single_word_input(&chunk_text, &state);
             prompts.push((
                 PromptKey {
                     parent_index: index,
                     chunk_index,
+                    is_short_input,
+                    is_single_word,
                 },
                 prompt,
             ));
@@ -202,6 +210,7 @@ fn run_batch_inference(
     while index < prompts.len() {
         let mut batch_indices = Vec::new();
         let mut batch_tokens = Vec::new();
+        let mut batch_max_output = MAX_OUTPUT_TOKENS;
         let mut token_count = 0usize;
 
         while index < prompts.len() {
@@ -216,12 +225,25 @@ fn run_batch_inference(
             }
 
             let token_len = tokens.len();
+            let prompt_max_output = if prompts[index].0.is_short_input {
+                SHORT_OUTPUT_TOKENS
+            } else {
+                MAX_OUTPUT_TOKENS
+            };
             if batch_tokens.len() >= max_sequences {
                 break;
             }
 
             if !batch_tokens.is_empty() && token_count + token_len > max_batch {
                 break;
+            }
+
+            if !batch_tokens.is_empty() && prompt_max_output != batch_max_output {
+                break;
+            }
+
+            if batch_tokens.is_empty() {
+                batch_max_output = prompt_max_output;
             }
 
             token_count += token_len;
@@ -234,9 +256,14 @@ fn run_batch_inference(
             continue;
         }
 
-        let outputs = run_batch_with_tokens(state, &batch_tokens)?;
+        let outputs = run_batch_with_tokens(state, &batch_tokens, batch_max_output)?;
         for (prompt_index, output) in batch_indices.into_iter().zip(outputs.into_iter()) {
-            results.push((prompt_index, output));
+            let filtered = if prompt_index.is_single_word {
+                filter_single_word_output(&output)
+            } else {
+                output
+            };
+            results.push((prompt_index, filtered));
         }
     }
 
@@ -246,6 +273,7 @@ fn run_batch_inference(
 fn run_batch_with_tokens(
     state: &mut LlamaState,
     prompt_tokens: &[Vec<LlamaToken>],
+    max_output_tokens: usize,
 ) -> Result<Vec<String>, llama_cpp_2::LlamaCppError> {
     state.ctx.clear_kv_cache();
     let stop_len = state.stop_tokens.len();
@@ -266,7 +294,7 @@ fn run_batch_with_tokens(
 
     state.ctx.decode(&mut batch).ok();
 
-    let mut output_tokens = vec![Vec::with_capacity(MAX_OUTPUT_TOKENS); seq_count];
+    let mut output_tokens = vec![Vec::with_capacity(max_output_tokens); seq_count];
     let mut positions: Vec<i32> = prompt_tokens
         .iter()
         .map(|tokens| tokens.len() as i32)
@@ -276,7 +304,7 @@ fn run_batch_with_tokens(
         .map(|seq_index| build_sampler(0x1234_u32.wrapping_add(seq_index as u32)))
         .collect();
 
-    for _ in 0..MAX_OUTPUT_TOKENS {
+    for _ in 0..max_output_tokens {
         let mut next_tokens = Vec::new();
         let mut active_indices = Vec::new();
 
@@ -548,6 +576,38 @@ fn trim_to_fit(
     }
 
     best
+}
+
+fn is_short_input_text(text: &str, state: &LlamaState) -> bool {
+    if text.trim().is_empty() {
+        return true;
+    }
+
+    state
+        .model
+        .str_to_token(text, AddBos::Never)
+        .unwrap_or_default()
+        .len()
+        <= SHORT_INPUT_TOKENS
+}
+
+fn is_single_word_input(text: &str, state: &LlamaState) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+
+    let mut words = trimmed.split_whitespace();
+    if words.next().is_none() {
+        return true;
+    }
+
+    words.next().is_none()
+}
+
+fn filter_single_word_output(output: &str) -> String {
+    let first_line = output.lines().next().unwrap_or(output).trim();
+    first_line.to_string()
 }
 
 fn locale_to_lang(locale: &str) -> (String, String) {
