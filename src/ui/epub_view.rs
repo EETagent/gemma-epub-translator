@@ -39,7 +39,7 @@ struct SharedUi {
     status_label: Label,
     cover_image: Option<Image>,
     current_path: Option<PathBuf>,
-    pending_paths: VecDeque<PathBuf>,
+    pending_paths: VecDeque<QueuedTranslation>,
     is_translating: Arc<AtomicBool>,
     translation_started_at: Option<Instant>,
 }
@@ -64,6 +64,13 @@ impl SharedUi {
             translation_started_at: None,
         }
     }
+}
+
+#[derive(Clone, Debug)]
+struct QueuedTranslation {
+    path: PathBuf,
+    source_locale: String,
+    target_locale: String,
 }
 
 pub struct EpubView {
@@ -330,7 +337,12 @@ impl EpubView {
 
         if should_queue {
             let mut ui = self.ui.borrow_mut();
-            ui.pending_paths.push_back(path);
+            let (source_locale, target_locale) = selected_locales(&ui);
+            ui.pending_paths.push_back(QueuedTranslation {
+                path,
+                source_locale,
+                target_locale,
+            });
             let queued = ui.pending_paths.len();
             let suffix = if queued == 1 { "" } else { "s" };
             ui.status_label
@@ -338,7 +350,11 @@ impl EpubView {
             return;
         }
 
-        self.start_translation_for_path(path);
+        let (source_locale, target_locale) = {
+            let ui = self.ui.borrow();
+            selected_locales(&ui)
+        };
+        self.start_translation_for_path(path, source_locale, target_locale);
     }
 
     pub fn open_urls(&self, urls: Vec<Url>) {
@@ -400,8 +416,8 @@ impl EpubView {
             ui.pending_paths.pop_front()
         };
 
-        if let Some(path) = next {
-            self.start_translation_for_path(path);
+        if let Some(next) = next {
+            self.start_translation_for_path(next.path, next.source_locale, next.target_locale);
         }
     }
 
@@ -415,7 +431,12 @@ impl EpubView {
         ui.translation_started_at = None;
     }
 
-    fn start_translation_for_path(&self, path: PathBuf) {
+    fn start_translation_for_path(
+        &self,
+        path: PathBuf,
+        source_locale: String,
+        target_locale: String,
+    ) {
         let mut ui = self.ui.borrow_mut();
         let mut opened = true;
 
@@ -447,7 +468,7 @@ impl EpubView {
         drop(ui);
 
         if opened {
-            self.analyze_and_start_translation(&path);
+            self.analyze_and_start_translation(&path, source_locale, target_locale);
         } else {
             self.start_next_from_queue();
         }
@@ -459,12 +480,17 @@ impl EpubView {
             ui.pending_paths.pop_front()
         };
 
-        if let Some(path) = next {
-            self.start_translation_for_path(path);
+        if let Some(next) = next {
+            self.start_translation_for_path(next.path, next.source_locale, next.target_locale);
         }
     }
 
-    fn analyze_and_start_translation(&self, path: &PathBuf) {
+    fn analyze_and_start_translation(
+        &self,
+        path: &PathBuf,
+        source_locale: String,
+        target_locale: String,
+    ) {
         let segments = match extract_text_segments(path) {
             Ok(result) => result,
             Err(err) => {
@@ -491,21 +517,6 @@ impl EpubView {
             ui.is_translating.store(true, Ordering::SeqCst);
             ui.translation_started_at = Some(Instant::now());
         }
-
-        let (source_locale, target_locale) = {
-            let ui = self.ui.borrow();
-            let source = SOURCE_LANGUAGES
-                .get(ui.source_lang_select.get_selected_index())
-                .map(|&(_, code)| code)
-                .unwrap_or("en-US");
-
-            let target = TARGET_LANGUAGES
-                .get(ui.lang_select.get_selected_index())
-                .map(|&(_, code)| code)
-                .unwrap_or("cs");
-
-            (source.to_string(), target.to_string())
-        };
 
         let path = path.clone();
         let is_translating = self.ui.borrow().is_translating.clone();
@@ -570,4 +581,18 @@ fn epub_paths_from_nsurls(urls: &[NSURL]) -> Vec<PathBuf> {
         .map(|url| url.pathbuf())
         .filter(is_epub_path)
         .collect()
+}
+
+fn selected_locales(ui: &SharedUi) -> (String, String) {
+    let source = SOURCE_LANGUAGES
+        .get(ui.source_lang_select.get_selected_index())
+        .map(|&(_, code)| code)
+        .unwrap_or("en-US");
+
+    let target = TARGET_LANGUAGES
+        .get(ui.lang_select.get_selected_index())
+        .map(|&(_, code)| code)
+        .unwrap_or("cs");
+
+    (source.to_string(), target.to_string())
 }
