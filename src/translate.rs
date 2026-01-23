@@ -736,5 +736,5 @@ fn tokens_end_with(tokens: &[LlamaToken], suffix: &[LlamaToken]) -> bool {
     }
 
     let start = tokens.len() - suffix.len();
-    tokens[start..] == suffix
+    tokens[start..] == *suffix
 }
