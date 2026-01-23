@@ -3,6 +3,7 @@ use cacao::appkit::tabview::item::TabViewItem;
 use cacao::appkit::tabview::traits::TabViewDelegate;
 use cacao::appkit::tabview::TabView;
 use cacao::appkit::window::Window;
+use cacao::appkit::window::{WindowConfig, WindowDelegate};
 use cacao::appkit::{App, AppDelegate};
 use cacao::events::EventModifierFlag;
 use cacao::foundation::id;
@@ -12,9 +13,12 @@ use cacao::objc::msg_send;
 use cacao::url::Url;
 use cacao::view::View;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use crate::translate::init_model;
 use crate::ui::epub_view::EpubView;
+use crate::ui::mycacao::alert::Alert;
 
 #[derive(Debug)]
 pub enum AppMessage {
@@ -26,10 +30,36 @@ pub enum AppMessage {
 }
 
 pub struct TranslatorApp {
-    window: Window,
+    window: Window<AppWindowDelegate>,
     content_view: View,
     tab_view: TabView,
     epub_view: EpubView,
+}
+
+struct AppWindowDelegate {
+    is_translating: Arc<AtomicBool>,
+}
+
+impl WindowDelegate for AppWindowDelegate {
+    const NAME: &'static str = "TranslatorWindowDelegate";
+
+    fn should_close(&self) -> bool {
+        if !self.is_translating.load(Ordering::SeqCst) {
+            return true;
+        }
+
+        let alert = Alert::new(
+            "Translation in progress",
+            "Closing the window will cancel the current translation and lose progress.",
+        );
+        let result = alert.show_with_cancel("Close", "Cancel");
+        if result.confirmed {
+            App::<TranslatorApp, AppMessage>::dispatch_main(AppMessage::CancelTranslation);
+            true
+        } else {
+            false
+        }
+    }
 }
 
 impl TranslatorApp {
@@ -37,9 +67,12 @@ impl TranslatorApp {
         let content_view = View::new();
         let tab_view = TabView::new();
         let epub_view = EpubView::new();
+        let window_delegate = AppWindowDelegate {
+            is_translating: epub_view.is_translating_flag(),
+        };
 
         let app = Self {
-            window: Window::default(),
+            window: Window::with(WindowConfig::default(), window_delegate),
             content_view,
             tab_view,
             epub_view,
@@ -68,7 +101,7 @@ impl TabViewDelegate for TranslatorApp {
 
 impl AppDelegate for TranslatorApp {
     fn should_terminate_after_last_window_closed(&self) -> bool {
-        return true
+        true
     }
 
     fn did_finish_launching(&self) {

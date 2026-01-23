@@ -309,6 +309,10 @@ impl EpubView {
             .get_from_backing_obj(|obj| obj as *const _ as cacao::foundation::id)
     }
 
+    pub fn is_translating_flag(&self) -> Arc<AtomicBool> {
+        self.ui.borrow().is_translating.clone()
+    }
+
     pub fn present_open_panel(&self) {
         let mut panel = FileSelectPanel::new();
         panel.set_message("Choose an EPUB file");
