@@ -67,6 +67,10 @@ impl TabViewDelegate for TranslatorApp {
 }
 
 impl AppDelegate for TranslatorApp {
+    fn should_terminate_after_last_window_closed(&self) -> bool {
+        return true
+    }
+
     fn did_finish_launching(&self) {
         App::set_menu(app_menus());
         App::activate();
