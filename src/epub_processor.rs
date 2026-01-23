@@ -1,8 +1,8 @@
 use crate::epub_rebuild::{output_path_with_locale, rebuild_epub_with, RebuildError};
 use crate::translate::translate_texts;
 use epub::doc::{DocError, EpubDoc};
-use lol_html::html_content::TextType;
-use lol_html::{text, HtmlRewriter, Settings};
+use lol_html::html_content::{ContentType, TextType};
+use lol_html::{element, text, HtmlRewriter, Settings};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -135,7 +135,10 @@ where
 
     rebuild_epub_with(input_path, &output_path, |name, bytes| {
         if is_html_name(name) {
-            Some(rewrite_html_with_translations(bytes, &translation_map))
+            Some(rewrite_html_with_translations(
+                bytes,
+                translation_map.clone(),
+            ))
         } else {
             None
         }
@@ -146,26 +149,41 @@ where
 
 fn extract_text_from_html(html: &str) -> Vec<String> {
     let texts = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-    let texts_writer = texts.clone();
+    let stack = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let stack_for_element = stack.clone();
+    let stack_for_text = stack.clone();
+    let texts_for_end = texts.clone();
 
     let mut rewriter = HtmlRewriter::new(
         Settings {
-            element_content_handlers: vec![text!("p,li,h1,h2,h3,h4,h5,h6", move |chunk| {
-                if chunk.text_type() == TextType::Data {
-                    let text = chunk.as_str().trim();
-                    if text.is_empty() {
-                        return Ok(());
+            element_content_handlers: vec![
+                element!("p,li,h1,h2,h3,h4,h5,h6", move |el| {
+                    stack_for_element.borrow_mut().push(String::new());
+                    if let Some(handlers) = el.end_tag_handlers() {
+                        let stack_for_end = stack_for_element.clone();
+                        let texts_for_end = texts_for_end.clone();
+                        handlers.push(Box::new(move |_end| {
+                            if let Some(content) = stack_for_end.borrow_mut().pop() {
+                                let normalized = content.replace("&nbsp;", " ");
+                                let trimmed = normalized.trim();
+                                if !trimmed.is_empty() {
+                                    texts_for_end.borrow_mut().push(trimmed.to_string());
+                                }
+                            }
+                            Ok(())
+                        }));
                     }
-
-                    let normalized = text.replace("&nbsp;", " ");
-                    if normalized.trim().is_empty() {
-                        return Ok(());
+                    Ok(())
+                }),
+                text!("p,li,h1,h2,h3,h4,h5,h6", move |chunk| {
+                    if chunk.text_type() == TextType::Data {
+                        if let Some(current) = stack_for_text.borrow_mut().last_mut() {
+                            current.push_str(chunk.as_str());
+                        }
                     }
-
-                    texts_writer.borrow_mut().push(text.to_string());
-                }
-                Ok(())
-            })],
+                    Ok(())
+                }),
+            ],
             ..Settings::default()
         },
         |_: &[u8]| {},
@@ -177,41 +195,70 @@ fn extract_text_from_html(html: &str) -> Vec<String> {
     texts.take()
 }
 
-fn rewrite_html_with_translations(bytes: &[u8], translations: &HashMap<String, String>) -> Vec<u8> {
-    let html = String::from_utf8_lossy(bytes);
-    let mut output = Vec::new();
+fn rewrite_html_with_translations(
+    bytes: &[u8],
+    translations: Arc<HashMap<String, String>>,
+) -> Vec<u8> {
+    let mut output = Vec::with_capacity(bytes.len());
 
-    let translations = translations.clone();
+    let stack = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let stack_for_element = stack.clone();
+    let stack_for_text = stack.clone();
+    let translations_for_end = translations.clone();
 
     let mut rewriter = HtmlRewriter::new(
         Settings {
-            element_content_handlers: vec![text!("p,li,h1,h2,h3,h4,h5,h6", move |chunk| {
-                if chunk.text_type() == TextType::Data {
-                    let original = chunk.as_str();
-                    let trimmed = original.trim();
+            element_content_handlers: vec![
+                element!("p,li,h1,h2,h3,h4,h5,h6", move |el| {
+                    stack_for_element.borrow_mut().push(String::new());
+                    if let Some(handlers) = el.end_tag_handlers() {
+                        let stack_for_end = stack_for_element.clone();
+                        let translations_for_end = translations_for_end.clone();
+                        handlers.push(Box::new(move |end| {
+                            if let Some(content) = stack_for_end.borrow_mut().pop() {
+                                let normalized = content.replace("&nbsp;", " ");
+                                let trimmed = normalized.trim();
+                                if trimmed.is_empty() {
+                                    return Ok(());
+                                }
 
-                    if !trimmed.is_empty() {
-                        if let Some(translated) = translations.get(trimmed) {
-                            let leading_ws: String =
-                                original.chars().take_while(|c| c.is_whitespace()).collect();
-                            let trailing_ws: String = original
-                                .chars()
-                                .rev()
-                                .take_while(|c| c.is_whitespace())
-                                .collect();
-                            let result = format!("{}{}{}", leading_ws, translated, trailing_ws);
-                            chunk.set_str(result);
+                                let leading_ws: String = normalized
+                                    .chars()
+                                    .take_while(|c| c.is_whitespace())
+                                    .collect();
+                                let trailing_ws: String = normalized
+                                    .chars()
+                                    .rev()
+                                    .take_while(|c| c.is_whitespace())
+                                    .collect();
+                                let translated = translations_for_end
+                                    .get(trimmed)
+                                    .cloned()
+                                    .unwrap_or_else(|| trimmed.to_string());
+                                let result = format!("{}{}{}", leading_ws, translated, trailing_ws);
+                                end.before(&result, ContentType::Text);
+                            }
+                            Ok(())
+                        }));
+                    }
+                    Ok(())
+                }),
+                text!("p,li,h1,h2,h3,h4,h5,h6", move |chunk| {
+                    if chunk.text_type() == TextType::Data {
+                        if let Some(current) = stack_for_text.borrow_mut().last_mut() {
+                            current.push_str(chunk.as_str());
+                            chunk.replace("", ContentType::Text);
                         }
                     }
-                }
-                Ok(())
-            })],
+                    Ok(())
+                }),
+            ],
             ..Settings::default()
         },
         |c: &[u8]| output.extend_from_slice(c),
     );
 
-    let _ = rewriter.write(html.as_bytes());
+    let _ = rewriter.write(bytes);
     let _ = rewriter.end();
 
     output
