@@ -488,14 +488,16 @@ impl EpubView {
             let source = match ui.source_lang_select.get_selected_index() {
                 0 => "en-US",
                 1 => "en-GB",
-                2 => "es",
-                3 => "ru",
-                4 => "de",
-                5 => "da",
+                2 => "cs",
+                3 => "es",
+                4 => "ru",
+                5 => "de",
+                6 => "da",
                 _ => "en-US",
             };
             let target = match ui.lang_select.get_selected_index() {
                 0 => "cs",
+                1 => "en-US",
                 _ => "cs",
             };
             (source.to_string(), target.to_string())
