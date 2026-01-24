@@ -417,7 +417,8 @@ fn init_state() -> LlamaState {
     let ctx_params = LlamaContextParams::default()
         .with_n_ctx(NonZeroU32::new(CTX_SIZE))
         .with_n_batch(N_BATCH)
-        .with_n_seq_max(MAX_SEQ_BATCH as u32);
+        .with_n_seq_max(MAX_SEQ_BATCH as u32)
+        .with_flash_attention_policy(1);
 
     let ctx = model
         .new_context(&backend, ctx_params)
