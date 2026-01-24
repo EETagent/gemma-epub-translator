@@ -36,6 +36,8 @@ pub struct LlamaState {
     ctx: llama_cpp_2::context::LlamaContext<'static>,
     max_seq_batch: usize,
     stop_tokens: Vec<LlamaToken>,
+    cached_prefix: Option<String>,
+    cached_prefix_len: usize,
 }
 
 unsafe impl Send for LlamaState {}
@@ -101,7 +103,7 @@ pub fn translate_texts_with_cancel(
     let limits = BatchLimits {
         max_prompt_tokens: CTX_SIZE as usize - MAX_OUTPUT_TOKENS,
         max_batch_tokens: state.ctx.n_batch() as usize,
-        max_sequences: state.max_seq_batch,
+        max_sequences: state.max_seq_batch.saturating_sub(1),
     };
     let mut outputs = vec![String::new(); texts.len()];
     let mut prompts = Vec::new();
@@ -185,13 +187,10 @@ fn run_batch_inference(
     cancel_flag: Option<&Arc<AtomicBool>>,
 ) -> Result<Vec<(PromptKey, String)>, llama_cpp_2::LlamaCppError> {
     let max_batch = state.ctx.n_batch() as usize;
-    let max_sequences = state.max_seq_batch;
+    let max_sequences = state.max_seq_batch.saturating_sub(1);
     let mut results = Vec::with_capacity(prompts.len());
     let mut index = 0;
-    let prefix_tokens = state
-        .model
-        .str_to_token(prompt_prefix, AddBos::Never)
-        .unwrap_or_default();
+    let prefix_len = ensure_prefix_cached(state, prompt_prefix)?;
 
     while index < prompts.len() {
         if let Some(flag) = cancel_flag {
@@ -252,7 +251,7 @@ fn run_batch_inference(
 
         let outputs = run_batch_with_tokens(
             state,
-            &prefix_tokens,
+            prefix_len,
             &batch_tokens,
             batch_max_output,
             cancel_flag,
@@ -272,35 +271,31 @@ fn run_batch_inference(
 
 fn run_batch_with_tokens(
     state: &mut LlamaState,
-    prefix_tokens: &[LlamaToken],
+    prefix_len: usize,
     prompt_tokens: &[Vec<LlamaToken>],
     max_output_tokens: usize,
     cancel_flag: Option<&Arc<AtomicBool>>,
 ) -> Result<Vec<String>, llama_cpp_2::LlamaCppError> {
-    state.ctx.clear_kv_cache();
     let stop_len = state.stop_tokens.len();
-    let prefix_len = prefix_tokens.len();
+    clear_transient_sequences(state);
 
     let total_tokens: usize = prompt_tokens.iter().map(|tokens| tokens.len()).sum();
     let seq_count = prompt_tokens.len();
+    let seq_max = (seq_count + 1) as i32;
 
-    if prefix_len > 0 {
-        let mut prefix_batch = LlamaBatch::new(prefix_len, 1);
-        prefix_batch.add_sequence(prefix_tokens, 0, false).ok();
-        state.ctx.decode(&mut prefix_batch).ok();
+    for seq_id in 1..=seq_count {
+        state
+            .ctx
+            .copy_kv_cache_seq(0, seq_id as i32, None, None)
+            .ok();
     }
 
-    let mut batch = LlamaBatch::new(total_tokens, seq_count as i32);
+    let mut batch = LlamaBatch::new(total_tokens, seq_max);
     let mut logits_indices = Vec::with_capacity(seq_count);
     let mut offset = 0usize;
 
     for (seq_id, tokens) in prompt_tokens.iter().enumerate() {
-        if seq_id > 0 && prefix_len > 0 {
-            state
-                .ctx
-                .copy_kv_cache_seq(0, seq_id as i32, None, None)
-                .ok();
-        }
+        let seq_id = seq_id + 1;
         for (token_index, token) in tokens.iter().enumerate() {
             let pos = prefix_len + token_index;
             let is_last = token_index + 1 == tokens.len();
@@ -328,7 +323,7 @@ fn run_batch_with_tokens(
     for _ in 0..max_output_tokens {
         if let Some(flag) = cancel_flag {
             if !flag.load(Ordering::SeqCst) {
-                state.ctx.clear_kv_cache();
+                clear_transient_sequences(state);
                 let outputs = output_tokens
                     .iter()
                     .map(|tokens| {
@@ -388,11 +383,16 @@ fn run_batch_with_tokens(
             break;
         }
 
-        let mut token_batch = LlamaBatch::new(active_indices.len(), seq_count as i32);
+        let mut token_batch = LlamaBatch::new(active_indices.len(), seq_max);
         for (batch_index, seq_index) in active_indices.iter().enumerate() {
             let pos = positions[*seq_index];
             token_batch
-                .add(next_tokens[batch_index], pos, &[*seq_index as i32], true)
+                .add(
+                    next_tokens[batch_index],
+                    pos,
+                    &[*seq_index as i32 + 1],
+                    true,
+                )
                 .ok();
             positions[*seq_index] += 1;
             logits_indices[*seq_index] = batch_index as i32;
@@ -446,6 +446,48 @@ fn init_state() -> LlamaState {
         ctx,
         max_seq_batch: MAX_SEQ_BATCH,
         stop_tokens,
+        cached_prefix: None,
+        cached_prefix_len: 0,
+    }
+}
+
+fn ensure_prefix_cached(
+    state: &mut LlamaState,
+    prompt_prefix: &str,
+) -> Result<usize, llama_cpp_2::LlamaCppError> {
+    if state.cached_prefix.as_deref() == Some(prompt_prefix) {
+        return Ok(state.cached_prefix_len);
+    }
+    println!("Updating cached prompt prefix...");
+
+    state.ctx.clear_kv_cache();
+    state.cached_prefix = None;
+    state.cached_prefix_len = 0;
+
+    let prefix_tokens = state
+        .model
+        .str_to_token(prompt_prefix, AddBos::Never)
+        .unwrap_or_default();
+    let prefix_len = prefix_tokens.len();
+    if prefix_len > 0 {
+        let mut prefix_batch = LlamaBatch::new(prefix_len, 1);
+        prefix_batch.add_sequence(&prefix_tokens, 0, false).ok();
+        state.ctx.decode(&mut prefix_batch)?;
+    }
+
+    state.cached_prefix = Some(prompt_prefix.to_string());
+    state.cached_prefix_len = prefix_len;
+
+    Ok(prefix_len)
+}
+
+fn clear_transient_sequences(state: &mut LlamaState) {
+    let max_sequences = state.max_seq_batch.saturating_sub(1);
+    for seq_id in 1..=max_sequences {
+        state
+            .ctx
+            .clear_kv_cache_seq(Some(seq_id as u32), None, None)
+            .ok();
     }
 }
 
