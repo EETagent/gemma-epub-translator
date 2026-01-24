@@ -38,6 +38,7 @@ pub struct LlamaState {
     stop_tokens: Vec<LlamaToken>,
     cached_prefix: Option<String>,
     cached_prefix_len: usize,
+    cached_prompt_suffix_len: usize,
 }
 
 unsafe impl Send for LlamaState {}
@@ -80,6 +81,11 @@ pub struct BatchLimits {
     pub max_sequences: usize,
 }
 
+struct TextChunk {
+    text: String,
+    tokens_len: usize,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct PromptKey {
     parent_index: usize,
@@ -110,22 +116,26 @@ pub fn translate_texts_with_cancel(
     let mut chunk_results: Vec<Vec<Option<String>>> = vec![Vec::new(); texts.len()];
     let prompt_prefix = build_prompt_prefix(source_locale, target_locale);
 
+    ensure_suffix_cached(&mut state);
+    // TODO: Error handling v translate_texts_with_cancel
+    ensure_prefix_cached(&mut state, &prompt_prefix).unwrap();
+
     for (index, text) in texts.iter().enumerate() {
         if text.trim().is_empty() {
             outputs[index] = text.to_string();
             continue;
         }
 
-        let chunks = split_text_to_fit(text, source_locale, target_locale, &state, &limits);
+        let chunks = split_text_to_fit(text, &state, &limits);
         if chunks.is_empty() {
             outputs[index] = text.to_string();
             continue;
         }
 
         chunk_results[index] = vec![None; chunks.len()];
-        for (chunk_index, chunk_text) in chunks.into_iter().enumerate() {
-            let is_short_input = is_short_input_text(&chunk_text, &state);
-            let is_single_word = is_single_word_input(&chunk_text, &state);
+        for (chunk_index, chunk) in chunks.into_iter().enumerate() {
+            let is_short_input = is_short_input_text_with_len(chunk.tokens_len);
+            let is_single_word = is_single_word_input(&chunk.text);
             prompts.push((
                 PromptKey {
                     parent_index: index,
@@ -133,7 +143,7 @@ pub fn translate_texts_with_cancel(
                     is_short_input,
                     is_single_word,
                 },
-                chunk_text,
+                chunk.text,
             ));
         }
     }
@@ -142,7 +152,7 @@ pub fn translate_texts_with_cancel(
         return outputs;
     }
 
-    match run_batch_inference(&mut state, &prompt_prefix, &prompts, cancel_flag) {
+    match run_batch_inference(&mut state, &prompts, cancel_flag) {
         Ok(results) => {
             for (key, translated) in results {
                 if let Some(chunks) = chunk_results.get_mut(key.parent_index) {
@@ -182,7 +192,6 @@ pub fn translate_texts_with_cancel(
 
 fn run_batch_inference(
     state: &mut LlamaState,
-    prompt_prefix: &str,
     prompts: &[(PromptKey, String)],
     cancel_flag: Option<&Arc<AtomicBool>>,
 ) -> Result<Vec<(PromptKey, String)>, llama_cpp_2::LlamaCppError> {
@@ -190,12 +199,12 @@ fn run_batch_inference(
     let max_sequences = state.max_seq_batch.saturating_sub(1);
     let mut results = Vec::with_capacity(prompts.len());
     let mut index = 0;
-    let prefix_len = ensure_prefix_cached(state, prompt_prefix)?;
+    let prefix_len = state.cached_prefix_len;
 
     while index < prompts.len() {
         if let Some(flag) = cancel_flag {
             if !flag.load(Ordering::SeqCst) {
-                state.ctx.clear_kv_cache();
+                clear_transient_sequences(state);
                 return Ok(results);
             }
         }
@@ -448,7 +457,20 @@ fn init_state() -> LlamaState {
         stop_tokens,
         cached_prefix: None,
         cached_prefix_len: 0,
+        cached_prompt_suffix_len: 0,
     }
+}
+
+fn ensure_suffix_cached(state: &mut LlamaState) {
+    if state.cached_prompt_suffix_len > 0 {
+        return;
+    }
+
+    let suffix_tokens = state
+        .model
+        .str_to_token(PROMPT_SUFFIX, AddBos::Never)
+        .unwrap_or_default();
+    state.cached_prompt_suffix_len = suffix_tokens.len();
 }
 
 fn ensure_prefix_cached(
@@ -468,17 +490,17 @@ fn ensure_prefix_cached(
         .model
         .str_to_token(prompt_prefix, AddBos::Never)
         .unwrap_or_default();
-    let prefix_len = prefix_tokens.len();
-    if prefix_len > 0 {
-        let mut prefix_batch = LlamaBatch::new(prefix_len, 1);
+    let prefix_tokens_len = prefix_tokens.len();
+    if prefix_tokens_len > 0 {
+        let mut prefix_batch = LlamaBatch::new(prefix_tokens_len, 1);
         prefix_batch.add_sequence(&prefix_tokens, 0, false).ok();
         state.ctx.decode(&mut prefix_batch)?;
     }
 
     state.cached_prefix = Some(prompt_prefix.to_string());
-    state.cached_prefix_len = prefix_len;
+    state.cached_prefix_len = prefix_tokens_len;
 
-    Ok(prefix_len)
+    Ok(prefix_tokens_len)
 }
 
 fn clear_transient_sequences(state: &mut LlamaState) {
@@ -489,11 +511,6 @@ fn clear_transient_sequences(state: &mut LlamaState) {
             .clear_kv_cache_seq(Some(seq_id as u32), None, None)
             .ok();
     }
-}
-
-fn build_prompt(text: &str, source_locale: &str, target_locale: &str) -> String {
-    let prefix = build_prompt_prefix(source_locale, target_locale);
-    format!("{}{}{}", prefix, text, PROMPT_SUFFIX)
 }
 
 fn build_prompt_prefix(source_locale: &str, target_locale: &str) -> String {
@@ -552,32 +569,42 @@ fn split_into_sentences(text: &str) -> Vec<String> {
     sentences
 }
 
-fn prompt_token_len(state: &LlamaState, prompt: &str) -> usize {
+fn text_token_len(state: &LlamaState, text: &str) -> usize {
+    if text.is_empty() {
+        return 0;
+    }
+
     state
         .model
-        .str_to_token(prompt, AddBos::Never)
+        .str_to_token(text, AddBos::Never)
         .unwrap_or_default()
         .len()
 }
 
 fn split_text_to_fit(
     text: &str,
-    source_locale: &str,
-    target_locale: &str,
     state: &LlamaState,
     limits: &BatchLimits,
-) -> Vec<String> {
+) -> Vec<TextChunk> {
     if text.trim().is_empty() {
         return Vec::new();
     }
 
-    let prompt = build_prompt(text, source_locale, target_locale);
-    if prompt_token_len(state, &prompt) <= limits.max_prompt_tokens {
-        return vec![text.to_string()];
+    let max_text_tokens = limits
+        .max_prompt_tokens
+        .saturating_sub(state.cached_prefix_len)
+        .saturating_sub(state.cached_prompt_suffix_len);
+    let full_len = text_token_len(state, text);
+    if full_len <= max_text_tokens {
+        return vec![TextChunk {
+            text: text.to_string(),
+            tokens_len: full_len,
+        }];
     }
 
     let mut sentences = Vec::new();
     let mut current = String::new();
+    let mut current_len = 0usize;
 
     for part in split_into_sentences(text) {
         let trimmed = part.trim();
@@ -585,44 +612,64 @@ fn split_text_to_fit(
             continue;
         }
 
+        let sentence_len = text_token_len(state, trimmed);
+        let sentence_with_space_len = if current.is_empty() {
+            sentence_len
+        } else {
+            let spaced = format!(" {}", trimmed);
+            text_token_len(state, &spaced)
+        };
+        let candidate_len = current_len.saturating_add(sentence_with_space_len);
+
         let candidate = if current.is_empty() {
             trimmed.to_string()
         } else {
             format!("{} {}", current, trimmed)
         };
 
-        let prompt = build_prompt(&candidate, source_locale, target_locale);
-        if prompt_token_len(state, &prompt) <= limits.max_prompt_tokens {
+        if candidate_len <= max_text_tokens {
             current = candidate;
+            current_len = candidate_len;
             continue;
         }
 
         if !current.is_empty() {
-            sentences.push(std::mem::take(&mut current));
+            sentences.push(TextChunk {
+                text: std::mem::take(&mut current),
+                tokens_len: current_len,
+            });
+            current_len = 0;
         }
 
-        let standalone = trimmed.to_string();
-        let prompt = build_prompt(&standalone, source_locale, target_locale);
-        if prompt_token_len(state, &prompt) <= limits.max_prompt_tokens {
-            current = standalone;
+        if sentence_len <= max_text_tokens {
+            current = trimmed.to_string();
+            current_len = sentence_len;
         } else {
             let mut remaining = trimmed.to_string();
             while !remaining.is_empty() {
-                let chunk = trim_to_fit(&remaining, source_locale, target_locale, state, limits)
+                let chunk = trim_to_fit(&remaining, state, max_text_tokens)
                     .unwrap_or_else(|| remaining.clone());
                 let chunk = chunk.trim();
                 if chunk.is_empty() {
                     break;
                 }
-                sentences.push(chunk.to_string());
+                let chunk_len = text_token_len(state, chunk);
+                sentences.push(TextChunk {
+                    text: chunk.to_string(),
+                    tokens_len: chunk_len,
+                });
                 remaining = remaining[chunk.len()..].trim_start().to_string();
             }
             current.clear();
+            current_len = 0;
         }
     }
 
     if !current.is_empty() {
-        sentences.push(current);
+        sentences.push(TextChunk {
+            text: current,
+            tokens_len: current_len,
+        });
     }
 
     if sentences.is_empty() {
@@ -632,13 +679,7 @@ fn split_text_to_fit(
     }
 }
 
-fn trim_to_fit(
-    text: &str,
-    source_locale: &str,
-    target_locale: &str,
-    state: &LlamaState,
-    limits: &BatchLimits,
-) -> Option<String> {
+fn trim_to_fit(text: &str, state: &LlamaState, max_text_tokens: usize) -> Option<String> {
     let candidate = text.trim().to_string();
     if candidate.is_empty() {
         return None;
@@ -654,8 +695,7 @@ fn trim_to_fit(
         let mid = (low + high) / 2;
         let slice_len = positions[mid];
         let slice = candidate[..slice_len].trim_end();
-        let prompt = build_prompt(slice, source_locale, target_locale);
-        if prompt_token_len(state, &prompt) <= limits.max_prompt_tokens {
+        if text_token_len(state, slice) <= max_text_tokens {
             best = Some(slice.to_string());
             low = mid + 1;
         } else {
@@ -666,20 +706,11 @@ fn trim_to_fit(
     best
 }
 
-fn is_short_input_text(text: &str, state: &LlamaState) -> bool {
-    if text.trim().is_empty() {
-        return true;
-    }
-
-    state
-        .model
-        .str_to_token(text, AddBos::Never)
-        .unwrap_or_default()
-        .len()
-        <= SHORT_INPUT_TOKENS
+fn is_short_input_text_with_len(tokens_len: usize) -> bool {
+    tokens_len <= SHORT_INPUT_TOKENS
 }
 
-fn is_single_word_input(text: &str, state: &LlamaState) -> bool {
+fn is_single_word_input(text: &str) -> bool {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return true;
