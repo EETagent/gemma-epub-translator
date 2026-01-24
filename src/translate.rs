@@ -10,6 +10,7 @@ use llama_cpp_2::token::LlamaToken;
 use std::env;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 // translategemma-4b-it-q8_0.gguf
@@ -19,7 +20,7 @@ const N_BATCH: u32 = 2048 * 4;
 const MAX_OUTPUT_TOKENS: usize = 512 * 4;
 const SHORT_OUTPUT_TOKENS: usize = 16;
 const SHORT_INPUT_TOKENS: usize = 4;
-const MAX_SEQ_BATCH: usize = 8*2;
+const MAX_SEQ_BATCH: usize = 8 * 2;
 const STOP_SEQUENCE: &str = "<end_of_turn>";
 const TOP_K: i32 = 64;
 const TOP_P: f32 = 0.95;
@@ -78,6 +79,15 @@ struct PromptKey {
 }
 
 pub fn translate_texts(texts: &[String], source_locale: &str, target_locale: &str) -> Vec<String> {
+    translate_texts_with_cancel(texts, source_locale, target_locale, None)
+}
+
+pub fn translate_texts_with_cancel(
+    texts: &[String],
+    source_locale: &str,
+    target_locale: &str,
+    cancel_flag: Option<&Arc<AtomicBool>>,
+) -> Vec<String> {
     if texts.is_empty() {
         return Vec::new();
     }
@@ -126,7 +136,7 @@ pub fn translate_texts(texts: &[String], source_locale: &str, target_locale: &st
         return outputs;
     }
 
-    match run_batch_inference(&mut state, &prompt_prefix, &prompts) {
+    match run_batch_inference(&mut state, &prompt_prefix, &prompts, cancel_flag) {
         Ok(results) => {
             for (key, translated) in results {
                 if let Some(chunks) = chunk_results.get_mut(key.parent_index) {
@@ -203,6 +213,7 @@ fn run_batch_inference(
     state: &mut LlamaState,
     prompt_prefix: &str,
     prompts: &[(PromptKey, String)],
+    cancel_flag: Option<&Arc<AtomicBool>>,
 ) -> Result<Vec<(PromptKey, String)>, llama_cpp_2::LlamaCppError> {
     let max_batch = state.ctx.n_batch() as usize;
     let max_sequences = state.max_seq_batch;
@@ -214,6 +225,13 @@ fn run_batch_inference(
         .unwrap_or_default();
 
     while index < prompts.len() {
+        if let Some(flag) = cancel_flag {
+            if !flag.load(Ordering::SeqCst) {
+                state.ctx.clear_kv_cache();
+                return Ok(results);
+            }
+        }
+
         let mut batch_indices = Vec::new();
         let mut batch_tokens = Vec::new();
         let mut batch_max_output = MAX_OUTPUT_TOKENS;
@@ -263,8 +281,13 @@ fn run_batch_inference(
             continue;
         }
 
-        let outputs =
-            run_batch_with_tokens(state, &prefix_tokens, &batch_tokens, batch_max_output)?;
+        let outputs = run_batch_with_tokens(
+            state,
+            &prefix_tokens,
+            &batch_tokens,
+            batch_max_output,
+            cancel_flag,
+        )?;
         for (prompt_index, output) in batch_indices.into_iter().zip(outputs.into_iter()) {
             let filtered = if prompt_index.is_single_word {
                 filter_single_word_output(&output)
@@ -283,6 +306,7 @@ fn run_batch_with_tokens(
     prefix_tokens: &[LlamaToken],
     prompt_tokens: &[Vec<LlamaToken>],
     max_output_tokens: usize,
+    cancel_flag: Option<&Arc<AtomicBool>>,
 ) -> Result<Vec<String>, llama_cpp_2::LlamaCppError> {
     state.ctx.clear_kv_cache();
     let stop_len = state.stop_tokens.len();
@@ -333,6 +357,24 @@ fn run_batch_with_tokens(
         .collect();
 
     for _ in 0..max_output_tokens {
+        if let Some(flag) = cancel_flag {
+            if !flag.load(Ordering::SeqCst) {
+                state.ctx.clear_kv_cache();
+                let outputs = output_tokens
+                    .iter()
+                    .map(|tokens| {
+                        state
+                            .model
+                            .tokens_to_str(tokens, Special::Plaintext)
+                            .unwrap_or_default()
+                            .trim()
+                            .to_string()
+                    })
+                    .collect();
+                return Ok(outputs);
+            }
+        }
+
         let mut next_tokens = Vec::new();
         let mut active_indices = Vec::new();
 

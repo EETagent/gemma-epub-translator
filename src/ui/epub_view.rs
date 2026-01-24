@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::epub_processor::{extract_text_segments, translate_epub_with_progress};
+use crate::epub_processor::{extract_text_segments, translate_epub_with_cancel, ProcessError};
 use crate::ui::app::{AppMessage, TranslatorApp};
 
 struct SharedUi {
@@ -531,8 +531,9 @@ impl EpubView {
             let completed_clone = completed.clone();
             let total_clone = total.clone();
             let is_translating_clone = is_translating.clone();
+            let cancel_flag = is_translating.clone();
 
-            let result = translate_epub_with_progress(
+            let result = translate_epub_with_cancel(
                 &path,
                 &source_locale,
                 &target_locale,
@@ -551,6 +552,7 @@ impl EpubView {
                         },
                     );
                 },
+                Some(cancel_flag),
             );
 
             if !is_translating.load(Ordering::SeqCst) {
@@ -559,6 +561,7 @@ impl EpubView {
 
             let message = match result {
                 Ok(path) => AppMessage::TranslationComplete(Ok(path)),
+                Err(ProcessError::Cancelled) => return, // Silently exit on cancellation
                 Err(err) => AppMessage::TranslationComplete(Err(format!("{:?}", err))),
             };
             App::<TranslatorApp, AppMessage>::dispatch_main(message);

@@ -1,16 +1,18 @@
 use crate::epub_rebuild::{output_path_with_locale, rebuild_epub_with, RebuildError};
-use crate::translate::translate_texts;
+use crate::translate::translate_texts_with_cancel;
 use epub::doc::{DocError, EpubDoc};
 use lol_html::html_content::{ContentType, TextType};
 use lol_html::{element, text, HtmlRewriter, Settings};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 #[derive(Debug)]
 pub enum ProcessError {
     Doc(DocError),
     Rebuild(RebuildError),
+    Cancelled,
 }
 
 impl From<DocError> for ProcessError {
@@ -78,11 +80,12 @@ pub fn extract_text_segments<P: AsRef<Path>>(path: P) -> Result<ExtractionResult
     })
 }
 
-pub fn translate_epub_with_progress<P, F>(
+pub fn translate_epub_with_cancel<P, F>(
     input_path: P,
     source_locale: &str,
     target_locale: &str,
     mut on_progress: F,
+    cancel_flag: Option<Arc<AtomicBool>>,
 ) -> Result<PathBuf, ProcessError>
 where
     P: AsRef<Path>,
@@ -105,11 +108,24 @@ where
     let mut start = 0usize;
 
     while start < total {
+        if let Some(ref flag) = cancel_flag {
+            if !flag.load(Ordering::SeqCst) {
+                return Err(ProcessError::Cancelled);
+            }
+        }
+
         let end = usize::min(start + batch_size, total);
         let slice = &extraction.segments[start..end];
         let texts: Vec<String> = slice.iter().map(|segment| segment.text.clone()).collect();
 
-        let translated_batch = translate_texts(&texts, source_locale, target_locale);
+        let translated_batch =
+            translate_texts_with_cancel(&texts, source_locale, target_locale, cancel_flag.as_ref());
+
+        if let Some(ref flag) = cancel_flag {
+            if !flag.load(Ordering::SeqCst) {
+                return Err(ProcessError::Cancelled);
+            }
+        }
 
         for (offset, segment) in slice.iter().enumerate() {
             let translated = translated_batch
@@ -129,6 +145,12 @@ where
         }
 
         start = end;
+    }
+
+    if let Some(ref flag) = cancel_flag {
+        if !flag.load(Ordering::SeqCst) {
+            return Err(ProcessError::Cancelled);
+        }
     }
 
     let translation_map = Arc::new(translation_map);
