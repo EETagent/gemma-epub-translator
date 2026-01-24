@@ -25,7 +25,8 @@ const TOP_K: i32 = 64;
 const TOP_P: f32 = 0.95;
 const TOP_P_MIN_KEEP: usize = 1;
 
-const PROMPT_TEMPLATE: &str = "<bos><start_of_turn>user\nYou are a professional {SOURCE_LANG} ({SOURCE_CODE}) to {TARGET_LANG} ({TARGET_CODE}) translator. Your goal is to accurately convey the meaning and nuances of the original {SOURCE_LANG} text while adhering to {TARGET_LANG} grammar, vocabulary, and cultural sensitivities.\nProduce only the {TARGET_LANG} translation, without any additional explanations or commentary. Please translate the following {SOURCE_LANG} text into {TARGET_LANG}:\n\n\n{TEXT}<end_of_turn>\n<start_of_turn>model\n";
+const PROMPT_PREFIX_TEMPLATE: &str = "<bos><start_of_turn>user\nYou are a professional {SOURCE_LANG} ({SOURCE_CODE}) to {TARGET_LANG} ({TARGET_CODE}) translator. Your goal is to accurately convey the meaning and nuances of the original {SOURCE_LANG} text while adhering to {TARGET_LANG} grammar, vocabulary, and cultural sensitivities.\nProduce only the {TARGET_LANG} translation, without any additional explanations or commentary. Please translate the following {SOURCE_LANG} text into {TARGET_LANG}:\n\n\n";
+const PROMPT_SUFFIX: &str = "<end_of_turn>\n<start_of_turn>model\n";
 
 static mut MODEL_STATE: OnceLock<Arc<Mutex<LlamaState>>> = OnceLock::new();
 
@@ -91,6 +92,7 @@ pub fn translate_texts(texts: &[String], source_locale: &str, target_locale: &st
     let mut outputs = vec![String::new(); texts.len()];
     let mut prompts = Vec::new();
     let mut chunk_results: Vec<Vec<Option<String>>> = vec![Vec::new(); texts.len()];
+    let prompt_prefix = build_prompt_prefix(source_locale, target_locale);
 
     for (index, text) in texts.iter().enumerate() {
         if text.trim().is_empty() {
@@ -106,7 +108,6 @@ pub fn translate_texts(texts: &[String], source_locale: &str, target_locale: &st
 
         chunk_results[index] = vec![None; chunks.len()];
         for (chunk_index, chunk_text) in chunks.into_iter().enumerate() {
-            let prompt = build_prompt(&chunk_text, source_locale, target_locale);
             let is_short_input = is_short_input_text(&chunk_text, &state);
             let is_single_word = is_single_word_input(&chunk_text, &state);
             prompts.push((
@@ -116,7 +117,7 @@ pub fn translate_texts(texts: &[String], source_locale: &str, target_locale: &st
                     is_short_input,
                     is_single_word,
                 },
-                prompt,
+                chunk_text,
             ));
         }
     }
@@ -125,7 +126,7 @@ pub fn translate_texts(texts: &[String], source_locale: &str, target_locale: &st
         return outputs;
     }
 
-    match run_batch_inference(&mut state, &prompts) {
+    match run_batch_inference(&mut state, &prompt_prefix, &prompts) {
         Ok(results) => {
             for (key, translated) in results {
                 if let Some(chunks) = chunk_results.get_mut(key.parent_index) {
@@ -200,12 +201,17 @@ fn get_model_state() -> Arc<Mutex<LlamaState>> {
 
 fn run_batch_inference(
     state: &mut LlamaState,
+    prompt_prefix: &str,
     prompts: &[(PromptKey, String)],
 ) -> Result<Vec<(PromptKey, String)>, llama_cpp_2::LlamaCppError> {
     let max_batch = state.ctx.n_batch() as usize;
     let max_sequences = state.max_seq_batch;
     let mut results = Vec::with_capacity(prompts.len());
     let mut index = 0;
+    let prefix_tokens = state
+        .model
+        .str_to_token(prompt_prefix, AddBos::Never)
+        .unwrap_or_default();
 
     while index < prompts.len() {
         let mut batch_indices = Vec::new();
@@ -214,9 +220,10 @@ fn run_batch_inference(
         let mut token_count = 0usize;
 
         while index < prompts.len() {
+            let prompt = format!("{}{}", prompts[index].1, PROMPT_SUFFIX);
             let tokens = state
                 .model
-                .str_to_token(&prompts[index].1, AddBos::Never)
+                .str_to_token(&prompt, AddBos::Never)
                 .unwrap_or_default();
             if tokens.is_empty() {
                 results.push((prompts[index].0, String::new()));
@@ -256,7 +263,8 @@ fn run_batch_inference(
             continue;
         }
 
-        let outputs = run_batch_with_tokens(state, &batch_tokens, batch_max_output)?;
+        let outputs =
+            run_batch_with_tokens(state, &prefix_tokens, &batch_tokens, batch_max_output)?;
         for (prompt_index, output) in batch_indices.into_iter().zip(outputs.into_iter()) {
             let filtered = if prompt_index.is_single_word {
                 filter_single_word_output(&output)
@@ -272,21 +280,41 @@ fn run_batch_inference(
 
 fn run_batch_with_tokens(
     state: &mut LlamaState,
+    prefix_tokens: &[LlamaToken],
     prompt_tokens: &[Vec<LlamaToken>],
     max_output_tokens: usize,
 ) -> Result<Vec<String>, llama_cpp_2::LlamaCppError> {
     state.ctx.clear_kv_cache();
     let stop_len = state.stop_tokens.len();
+    let prefix_len = prefix_tokens.len();
 
     let total_tokens: usize = prompt_tokens.iter().map(|tokens| tokens.len()).sum();
     let seq_count = prompt_tokens.len();
+
+    if prefix_len > 0 {
+        let mut prefix_batch = LlamaBatch::new(prefix_len, 1);
+        prefix_batch.add_sequence(prefix_tokens, 0, false).ok();
+        state.ctx.decode(&mut prefix_batch).ok();
+    }
 
     let mut batch = LlamaBatch::new(total_tokens, seq_count as i32);
     let mut logits_indices = Vec::with_capacity(seq_count);
     let mut offset = 0usize;
 
     for (seq_id, tokens) in prompt_tokens.iter().enumerate() {
-        batch.add_sequence(tokens, seq_id as i32, false).ok();
+        if seq_id > 0 && prefix_len > 0 {
+            state
+                .ctx
+                .copy_kv_cache_seq(0, seq_id as i32, None, None)
+                .ok();
+        }
+        for (token_index, token) in tokens.iter().enumerate() {
+            let pos = prefix_len + token_index;
+            let is_last = token_index + 1 == tokens.len();
+            batch
+                .add(*token, pos as i32, &[seq_id as i32], is_last)
+                .ok();
+        }
         let last_offset = offset + tokens.len().saturating_sub(1);
         logits_indices.push(last_offset as i32);
         offset += tokens.len();
@@ -297,7 +325,7 @@ fn run_batch_with_tokens(
     let mut output_tokens = vec![Vec::with_capacity(max_output_tokens); seq_count];
     let mut positions: Vec<i32> = prompt_tokens
         .iter()
-        .map(|tokens| tokens.len() as i32)
+        .map(|tokens| (prefix_len + tokens.len()) as i32)
         .collect();
     let mut active = vec![true; seq_count];
     let mut samplers: Vec<LlamaSampler> = (0..seq_count)
@@ -408,15 +436,19 @@ fn init_state() -> LlamaState {
 }
 
 fn build_prompt(text: &str, source_locale: &str, target_locale: &str) -> String {
+    let prefix = build_prompt_prefix(source_locale, target_locale);
+    format!("{}{}{}", prefix, text, PROMPT_SUFFIX)
+}
+
+fn build_prompt_prefix(source_locale: &str, target_locale: &str) -> String {
     let (source_lang, source_code) = locale_to_lang(source_locale);
     let (target_lang, target_code) = locale_to_lang(target_locale);
 
-    PROMPT_TEMPLATE
+    PROMPT_PREFIX_TEMPLATE
         .replace("{SOURCE_LANG}", source_lang.as_str())
         .replace("{SOURCE_CODE}", source_code.as_str())
         .replace("{TARGET_LANG}", target_lang.as_str())
         .replace("{TARGET_CODE}", target_code.as_str())
-        .replace("{TEXT}", text)
 }
 
 fn model_path() -> PathBuf {
