@@ -4,6 +4,7 @@ mod translate;
 mod ui;
 
 use std::env;
+use std::sync::{Arc, Mutex};
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -14,17 +15,21 @@ fn main() {
     }
 
     use cacao::appkit::App;
-    App::new("com.github.EETagent.gemma-translator", ui::app::TranslatorApp::new()).run();
+    App::new(
+        "com.github.EETagent.gemma-translator",
+        ui::app::TranslatorApp::new(),
+    )
+    .run();
 }
 
 fn run_cli_test(args: &[String]) {
     println!("=== Gemma Translator CLI Test ===\n");
 
-    if args.is_empty() {
-        println!("Loading model...");
-        translate::init_model();
-        println!("Model loaded!\n");
+    println!("Loading model...");
+    let state = Arc::new(Mutex::new(translate::create_state()));
+    println!("Model loaded!\n");
 
+    if args.is_empty() {
         let test_texts = vec![
             "Hello, world!".to_string(),
             "The quick brown fox jumps over the lazy dog.".to_string(),
@@ -32,19 +37,15 @@ fn run_cli_test(args: &[String]) {
             "This is a test of the translation system.".to_string(),
         ];
 
-        let translated = translate::translate_texts(&test_texts, "en-US", "cs");
+        let translated = translate::translate_texts_with_state(&state, &test_texts, "en-US", "cs");
         for (text, translated) in test_texts.iter().zip(translated.iter()) {
             println!("Original: {}", text);
             println!("Czech:    {}\n", translated);
         }
     } else {
-        println!("Loading model...");
-        translate::init_model();
-        println!("Model loaded!\n");
-
         let text = args.join(" ");
         println!("Original: {}", text);
-        let translated = translate::translate_text(&text, "en-US", "cs");
+        let translated = translate::translate_text_with_state(&state, &text, "en-US", "cs");
         println!("Czech:    {}", translated);
     }
 }

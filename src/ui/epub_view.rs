@@ -1,6 +1,7 @@
 use cacao::appkit::App;
 use cacao::button::{BezelStyle, Button};
 use cacao::color::Color;
+use cacao::control::Control;
 use cacao::dragdrop::{DragInfo, DragOperation};
 use cacao::filesystem::FileSelectPanel;
 use cacao::foundation::NSURL;
@@ -20,10 +21,11 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::epub_processor::{extract_text_segments, translate_epub_with_cancel, ProcessError};
+use crate::translate::LlamaState;
 use crate::ui::app::{AppMessage, TranslatorApp};
 
 struct SharedUi {
@@ -42,6 +44,7 @@ struct SharedUi {
     pending_paths: VecDeque<QueuedTranslation>,
     is_translating: Arc<AtomicBool>,
     translation_started_at: Option<Instant>,
+    model_state: Option<Arc<Mutex<LlamaState>>>,
 }
 
 impl SharedUi {
@@ -62,6 +65,7 @@ impl SharedUi {
             pending_paths: VecDeque::new(),
             is_translating: Arc::new(AtomicBool::new(false)),
             translation_started_at: None,
+            model_state: None,
         }
     }
 }
@@ -300,6 +304,25 @@ impl EpubView {
         }
     }
 
+    pub fn set_model_state(&self, state: Arc<Mutex<LlamaState>>) {
+        let mut ui = self.ui.borrow_mut();
+        ui.model_state = Some(state);
+        ui.status_label
+            .set_text("Model loaded. Ready to translate.");
+        ui.btn_translate.set_enabled(true);
+    }
+
+    pub fn clear_model_state(&self) {
+        let mut ui = self.ui.borrow_mut();
+        ui.model_state = None;
+    }
+
+    pub fn set_loading_model(&self) {
+        let ui = self.ui.borrow();
+        ui.status_label.set_text("Loading model...");
+        ui.btn_translate.set_enabled(false);
+    }
+
     pub fn view(&self) -> &View<ContentView> {
         &self.view
     }
@@ -329,7 +352,7 @@ impl EpubView {
 
     pub fn handle_open_file(&self, path: PathBuf) {
         if !is_epub_path(&path) {
-            let mut ui = self.ui.borrow_mut();
+            let ui = self.ui.borrow_mut();
             ui.status_label.set_text("Please select an .epub file.");
             return;
         }
@@ -368,7 +391,7 @@ impl EpubView {
     }
 
     pub fn handle_progress(&self, completed: usize, total: usize) {
-        let mut ui = self.ui.borrow_mut();
+        let ui = self.ui.borrow_mut();
         let queued = ui.pending_paths.len();
         let percentage = if total > 0 {
             (completed as f64 / total as f64) * 100.0
@@ -495,10 +518,24 @@ impl EpubView {
         source_locale: String,
         target_locale: String,
     ) {
+        let model_state = {
+            let ui = self.ui.borrow();
+            match &ui.model_state {
+                Some(state) => state.clone(),
+                None => {
+                    drop(ui);
+                    let ui = self.ui.borrow_mut();
+                    ui.status_label
+                        .set_text("Model not loaded yet. Please wait...");
+                    return;
+                }
+            }
+        };
+
         let segments = match extract_text_segments(path) {
             Ok(result) => result,
             Err(err) => {
-                let mut ui = self.ui.borrow_mut();
+                let ui = self.ui.borrow_mut();
                 ui.status_label
                     .set_text(&format!("Failed to parse EPUB: {err:?}"));
                 return;
@@ -534,6 +571,7 @@ impl EpubView {
             let cancel_flag = is_translating.clone();
 
             let result = translate_epub_with_cancel(
+                &model_state,
                 &path,
                 &source_locale,
                 &target_locale,

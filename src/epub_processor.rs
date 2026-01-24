@@ -1,12 +1,12 @@
 use crate::epub_rebuild::{output_path_with_locale, rebuild_epub_with, RebuildError};
-use crate::translate::translate_texts_with_cancel;
+use crate::translate::{translate_texts_with_cancel, LlamaState};
 use epub::doc::{DocError, EpubDoc};
 use lol_html::html_content::{ContentType, TextType};
 use lol_html::{element, text, HtmlRewriter, Settings};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug)]
 pub enum ProcessError {
@@ -81,6 +81,7 @@ pub fn extract_text_segments<P: AsRef<Path>>(path: P) -> Result<ExtractionResult
 }
 
 pub fn translate_epub_with_cancel<P, F>(
+    state: &Arc<Mutex<LlamaState>>,
     input_path: P,
     source_locale: &str,
     target_locale: &str,
@@ -118,8 +119,13 @@ where
         let slice = &extraction.segments[start..end];
         let texts: Vec<String> = slice.iter().map(|segment| segment.text.clone()).collect();
 
-        let translated_batch =
-            translate_texts_with_cancel(&texts, source_locale, target_locale, cancel_flag.as_ref());
+        let translated_batch = translate_texts_with_cancel(
+            state,
+            &texts,
+            source_locale,
+            target_locale,
+            cancel_flag.as_ref(),
+        );
 
         if let Some(ref flag) = cancel_flag {
             if !flag.load(Ordering::SeqCst) {

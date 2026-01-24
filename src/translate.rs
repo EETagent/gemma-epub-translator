@@ -11,7 +11,7 @@ use std::env;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 // translategemma-4b-it-q8_0.gguf
 const MODEL_FILE: &str = "translategemma-12b-it.Q4_K_M.gguf";
@@ -29,39 +29,47 @@ const TOP_P_MIN_KEEP: usize = 1;
 const PROMPT_PREFIX_TEMPLATE: &str = "<bos><start_of_turn>user\nYou are a professional {SOURCE_LANG} ({SOURCE_CODE}) to {TARGET_LANG} ({TARGET_CODE}) translator. Your goal is to accurately convey the meaning and nuances of the original {SOURCE_LANG} text while adhering to {TARGET_LANG} grammar, vocabulary, and cultural sensitivities.\nProduce only the {TARGET_LANG} translation, without any additional explanations or commentary. Please translate the following {SOURCE_LANG} text into {TARGET_LANG}:\n\n\n";
 const PROMPT_SUFFIX: &str = "<end_of_turn>\n<start_of_turn>model\n";
 
-static mut MODEL_STATE: OnceLock<Arc<Mutex<LlamaState>>> = OnceLock::new();
-
-struct LlamaState {
+pub struct LlamaState {
     #[allow(dead_code)]
     backend: LlamaBackend,
-    model: &'static LlamaModel,
+    model: Box<LlamaModel>,
     ctx: llama_cpp_2::context::LlamaContext<'static>,
     max_seq_batch: usize,
     stop_tokens: Vec<LlamaToken>,
 }
 
 unsafe impl Send for LlamaState {}
+unsafe impl Sync for LlamaState {}
 
-pub fn init_model() {
-    let _ = get_model_state();
+pub fn create_state() -> LlamaState {
+    init_state()
 }
 
-pub fn shutdown_model() {
-    unsafe {
-        MODEL_STATE.take().unwrap();
-    }
-}
-
-pub fn translate_text(text: &str, source_locale: &str, target_locale: &str) -> String {
+pub fn translate_text_with_state(
+    state: &Arc<Mutex<LlamaState>>,
+    text: &str,
+    source_locale: &str,
+    target_locale: &str,
+) -> String {
     if text.trim().is_empty() {
         return text.to_string();
     }
 
-    let results = translate_texts(&[text.to_string()], source_locale, target_locale);
+    let results =
+        translate_texts_with_state(state, &[text.to_string()], source_locale, target_locale);
     results
         .into_iter()
         .next()
         .unwrap_or_else(|| text.to_string())
+}
+
+pub fn translate_texts_with_state(
+    state: &Arc<Mutex<LlamaState>>,
+    texts: &[String],
+    source_locale: &str,
+    target_locale: &str,
+) -> Vec<String> {
+    translate_texts_with_cancel(state, texts, source_locale, target_locale, None)
 }
 
 pub struct BatchLimits {
@@ -78,11 +86,8 @@ struct PromptKey {
     is_single_word: bool,
 }
 
-pub fn translate_texts(texts: &[String], source_locale: &str, target_locale: &str) -> Vec<String> {
-    translate_texts_with_cancel(texts, source_locale, target_locale, None)
-}
-
 pub fn translate_texts_with_cancel(
+    state: &Arc<Mutex<LlamaState>>,
     texts: &[String],
     source_locale: &str,
     target_locale: &str,
@@ -92,7 +97,6 @@ pub fn translate_texts_with_cancel(
         return Vec::new();
     }
 
-    let state = get_model_state();
     let mut state = state.lock().expect("llama state lock");
     let limits = BatchLimits {
         max_prompt_tokens: CTX_SIZE as usize - MAX_OUTPUT_TOKENS,
@@ -172,41 +176,6 @@ pub fn translate_texts_with_cancel(
     }
 
     outputs
-}
-
-pub fn batch_limits() -> BatchLimits {
-    let state = get_model_state();
-    let state = state.lock().expect("llama state lock");
-
-    BatchLimits {
-        max_prompt_tokens: CTX_SIZE as usize - MAX_OUTPUT_TOKENS,
-        max_batch_tokens: state.ctx.n_batch() as usize,
-        max_sequences: state.max_seq_batch,
-    }
-}
-
-pub fn prompt_token_count(text: &str, source_locale: &str, target_locale: &str) -> usize {
-    if text.trim().is_empty() {
-        return 0;
-    }
-
-    let prompt = build_prompt(text, source_locale, target_locale);
-    let state = get_model_state();
-    let state = state.lock().expect("llama state lock");
-
-    prompt_token_len(&state, &prompt)
-}
-
-pub fn is_model_ready() -> bool {
-    unsafe { MODEL_STATE.get().is_some() }
-}
-
-fn get_model_state() -> Arc<Mutex<LlamaState>> {
-    unsafe {
-        MODEL_STATE
-            .get_or_init(|| Arc::new(Mutex::new(init_state())))
-            .clone()
-    }
 }
 
 fn run_batch_inference(
@@ -454,7 +423,6 @@ fn init_state() -> LlamaState {
     let model = Box::new(
         LlamaModel::load_from_file(&backend, &model_path(), &model_params).expect("load model"),
     );
-    let model = Box::leak(model);
 
     let ctx_params = LlamaContextParams::default()
         .with_n_ctx(NonZeroU32::new(CTX_SIZE))
@@ -462,7 +430,10 @@ fn init_state() -> LlamaState {
         .with_n_seq_max(MAX_SEQ_BATCH as u32)
         .with_flash_attention_policy(1);
 
-    let ctx = model
+    // TODO: The model is stored in the same struct as the context, so the model will outlive the context. We use unsafe to extend the lifetime.
+    let model_ref: &'static LlamaModel = unsafe { &*(&*model as *const LlamaModel) };
+
+    let ctx = model_ref
         .new_context(&backend, ctx_params)
         .expect("init context");
     let stop_tokens = model

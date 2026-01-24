@@ -14,9 +14,9 @@ use cacao::url::Url;
 use cacao::view::View;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use crate::translate::init_model;
+use crate::translate::{create_state, LlamaState};
 use crate::ui::epub_view::EpubView;
 use crate::ui::mycacao::alert::Alert;
 
@@ -27,6 +27,7 @@ pub enum AppMessage {
     TranslationProgress { completed: usize, total: usize },
     TranslationComplete(Result<PathBuf, String>),
     CancelTranslation,
+    ModelLoaded,
 }
 
 pub struct TranslatorApp {
@@ -34,6 +35,7 @@ pub struct TranslatorApp {
     content_view: View,
     tab_view: TabView,
     epub_view: EpubView,
+    model_state: Arc<Mutex<Option<Arc<Mutex<LlamaState>>>>>,
 }
 
 struct AppWindowDelegate {
@@ -76,6 +78,7 @@ impl TranslatorApp {
             content_view,
             tab_view,
             epub_view,
+            model_state: Arc::new(Mutex::new(None)),
         };
 
         app.tab_view.set_delegate(&app);
@@ -108,8 +111,14 @@ impl AppDelegate for TranslatorApp {
         App::set_menu(app_menus());
         App::activate();
 
-        std::thread::spawn(|| {
-            init_model();
+        self.epub_view.set_loading_model();
+
+        let model_state_ref = self.model_state.clone();
+        std::thread::spawn(move || {
+            let state = create_state();
+            let state = Arc::new(Mutex::new(state));
+            *model_state_ref.lock().unwrap() = Some(state);
+            App::<TranslatorApp, AppMessage>::dispatch_main(AppMessage::ModelLoaded);
         });
 
         self.window.set_minimum_content_size(520., 720.);
@@ -139,7 +148,18 @@ impl AppDelegate for TranslatorApp {
     }
 
     fn will_terminate(&self) {
-        crate::translate::shutdown_model();
+        if self.epub_view.is_translating_flag().load(Ordering::SeqCst) {
+            self.epub_view.handle_cancel();
+            std::thread::sleep(std::time::Duration::from_millis(750));
+        }
+
+        self.epub_view.clear_model_state();
+
+        if let Ok(mut lock) = self.model_state.lock() {
+            *lock = None;
+        }
+
+        //std::process::exit(0);
     }
 
     fn open_urls(&self, urls: Vec<Url>) {
@@ -167,6 +187,11 @@ impl Dispatcher for TranslatorApp {
                 self.epub_view.handle_completion(result);
             }
             AppMessage::CancelTranslation => self.epub_view.handle_cancel(),
+            AppMessage::ModelLoaded => {
+                if let Some(state) = self.model_state.lock().unwrap().clone() {
+                    self.epub_view.set_model_state(state);
+                }
+            }
         }
     }
 }
