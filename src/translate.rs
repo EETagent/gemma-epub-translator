@@ -106,8 +106,9 @@ pub fn translate_texts_with_cancel(
     }
 
     let mut state = state.lock().expect("llama state lock");
+    let per_seq_capacity = (CTX_SIZE as usize) / state.max_seq_batch.max(1);
     let limits = BatchLimits {
-        max_prompt_tokens: CTX_SIZE as usize - MAX_OUTPUT_TOKENS,
+        max_prompt_tokens: per_seq_capacity.saturating_sub(MAX_OUTPUT_TOKENS),
         max_batch_tokens: state.ctx.n_batch() as usize,
         max_sequences: state.max_seq_batch.saturating_sub(1),
     };
