@@ -323,6 +323,13 @@ impl EpubView {
         ui.btn_translate.set_enabled(false);
     }
 
+    pub fn set_model_load_error(&self, error: &str) {
+        let ui = self.ui.borrow();
+        ui.status_label
+            .set_text(&format!("Failed to load model: {}", error));
+        ui.btn_translate.set_enabled(false);
+    }
+
     pub fn view(&self) -> &View<ContentView> {
         &self.view
     }

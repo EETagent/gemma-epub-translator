@@ -825,6 +825,7 @@ dependencies = [
  "image",
  "llama-cpp-2",
  "lol_html",
+ "thiserror 2.0.18",
  "zip 0.6.6",
 ]
 

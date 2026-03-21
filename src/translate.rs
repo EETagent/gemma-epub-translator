@@ -1,17 +1,22 @@
+use llama_cpp_2::context::kv_cache::KvCacheConversionError;
 use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
-use llama_cpp_2::llama_batch::LlamaBatch;
+use llama_cpp_2::llama_batch::{BatchAddError, LlamaBatch};
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaModel, Special};
 use llama_cpp_2::token::data::LlamaTokenData;
 use llama_cpp_2::token::data_array::LlamaTokenDataArray;
 use llama_cpp_2::token::LlamaToken;
+use llama_cpp_2::{
+    DecodeError, LlamaContextLoadError, LlamaCppError, LlamaModelLoadError, TokenToStringError,
+};
 use std::collections::HashMap;
 use std::env;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use thiserror::Error;
 
 // translategemma-4b-it-q8_0.gguf
 const MODEL_FILE: &str = "translategemma-12b-it.Q4_K_M.gguf";
@@ -27,10 +32,10 @@ const PROMPT_PREFIX_TEMPLATE: &str = "<bos><start_of_turn>user\nYou are a profes
 const PROMPT_SUFFIX: &str = "<end_of_turn>\n<start_of_turn>model\n";
 
 pub struct LlamaState {
+    ctx: llama_cpp_2::context::LlamaContext<'static>,
+    model: Box<LlamaModel>,
     #[allow(dead_code)]
     backend: LlamaBackend,
-    model: Box<LlamaModel>,
-    ctx: llama_cpp_2::context::LlamaContext<'static>,
     max_seq_batch: usize,
     stop_tokens: Vec<LlamaToken>,
     cached_prefix: Option<String>,
@@ -42,7 +47,31 @@ pub struct LlamaState {
 unsafe impl Send for LlamaState {}
 unsafe impl Sync for LlamaState {}
 
-pub fn create_state() -> LlamaState {
+type TranslateResult<T> = Result<T, TranslateError>;
+
+#[derive(Debug, Error)]
+pub enum TranslateError {
+    #[error(transparent)]
+    LlamaBackend(#[from] LlamaCppError),
+    #[error(transparent)]
+    ModelLoad(#[from] LlamaModelLoadError),
+    #[error(transparent)]
+    ContextLoad(#[from] LlamaContextLoadError),
+    #[error(transparent)]
+    Decode(#[from] DecodeError),
+    #[error(transparent)]
+    BatchAdd(#[from] BatchAddError),
+    #[error(transparent)]
+    KvCache(#[from] KvCacheConversionError),
+    #[error(transparent)]
+    TokenToString(#[from] TokenToStringError),
+    #[error("unsupported locale: {0}")]
+    UnsupportedLocale(String),
+    #[error("llama state lock poisoned")]
+    StateLockPoisoned,
+}
+
+pub fn create_state() -> Result<LlamaState, TranslateError> {
     init_state()
 }
 
@@ -51,17 +80,17 @@ pub fn translate_text_with_state(
     text: &str,
     source_locale: &str,
     target_locale: &str,
-) -> String {
+) -> Result<String, TranslateError> {
     if text.trim().is_empty() {
-        return text.to_string();
+        return Ok(text.to_string());
     }
 
     let results =
-        translate_texts_with_state(state, &[text.to_string()], source_locale, target_locale);
-    results
+        translate_texts_with_state(state, &[text.to_string()], source_locale, target_locale)?;
+    Ok(results
         .into_iter()
         .next()
-        .unwrap_or_else(|| text.to_string())
+        .unwrap_or_else(|| text.to_string()))
 }
 
 pub fn translate_texts_with_state(
@@ -69,7 +98,7 @@ pub fn translate_texts_with_state(
     texts: &[String],
     source_locale: &str,
     target_locale: &str,
-) -> Vec<String> {
+) -> Result<Vec<String>, TranslateError> {
     translate_texts_with_cancel(state, texts, source_locale, target_locale, None)
 }
 
@@ -104,12 +133,15 @@ pub fn translate_texts_with_cancel(
     source_locale: &str,
     target_locale: &str,
     cancel_flag: Option<&Arc<AtomicBool>>,
-) -> Vec<String> {
+) -> Result<Vec<String>, TranslateError> {
     if texts.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
-    let mut state = state.lock().expect("llama state lock");
+    let mut state = state
+        .lock()
+        .map_err(|_| TranslateError::StateLockPoisoned)?;
+
     let per_seq_capacity = (CTX_SIZE as usize) / state.max_seq_batch.max(1);
     let limits = BatchLimits {
         max_prompt_tokens: per_seq_capacity.saturating_sub(MAX_OUTPUT_TOKENS),
@@ -119,11 +151,10 @@ pub fn translate_texts_with_cancel(
     let mut outputs = vec![String::new(); texts.len()];
     let mut prompts: Vec<PreparedPrompt> = Vec::new();
     let mut chunk_results: Vec<Vec<Option<String>>> = vec![Vec::new(); texts.len()];
-    let prompt_prefix = build_prompt_prefix(source_locale, target_locale);
+    let prompt_prefix = build_prompt_prefix(source_locale, target_locale)?;
 
     ensure_suffix_cached(&mut state);
-    // TODO: Error handling v translate_texts_with_cancel
-    ensure_prefix_cached(&mut state, &prompt_prefix).unwrap();
+    ensure_prefix_cached(&mut state, &prompt_prefix)?;
 
     for (index, text) in texts.iter().enumerate() {
         if text.trim().is_empty() {
@@ -156,7 +187,7 @@ pub fn translate_texts_with_cancel(
     }
 
     if prompts.is_empty() {
-        return outputs;
+        return Ok(outputs);
     }
 
     match run_batch_inference(&mut state, &prompts, cancel_flag) {
@@ -169,11 +200,7 @@ pub fn translate_texts_with_cancel(
                 }
             }
         }
-        Err(_) => {
-            for prompt in &prompts {
-                outputs[prompt.key.parent_index] = texts[prompt.key.parent_index].to_string();
-            }
-        }
+        Err(err) => return Err(err),
     }
 
     for (index, chunks) in chunk_results.into_iter().enumerate() {
@@ -194,14 +221,14 @@ pub fn translate_texts_with_cancel(
         outputs[index] = joined;
     }
 
-    outputs
+    Ok(outputs)
 }
 
 fn run_batch_inference(
     state: &mut LlamaState,
     prompts: &[PreparedPrompt],
     cancel_flag: Option<&Arc<AtomicBool>>,
-) -> Result<Vec<(PromptKey, String)>, llama_cpp_2::LlamaCppError> {
+) -> TranslateResult<Vec<(PromptKey, String)>> {
     let max_batch = state.ctx.n_batch() as usize;
     let max_sequences = state.max_seq_batch.saturating_sub(1);
     let mut results = Vec::with_capacity(prompts.len());
@@ -211,7 +238,7 @@ fn run_batch_inference(
     while index < prompts.len() {
         if let Some(flag) = cancel_flag {
             if !flag.load(Ordering::SeqCst) {
-                clear_transient_sequences(state);
+                clear_transient_sequences(state)?;
                 return Ok(results);
             }
         }
@@ -287,19 +314,16 @@ fn run_batch_with_tokens(
     prompt_tokens: &[Vec<LlamaToken>],
     max_output_tokens: usize,
     cancel_flag: Option<&Arc<AtomicBool>>,
-) -> Result<Vec<String>, llama_cpp_2::LlamaCppError> {
+) -> TranslateResult<Vec<String>> {
     let stop_len = state.stop_tokens.len();
-    clear_transient_sequences(state);
+    clear_transient_sequences(state)?;
 
     let total_tokens: usize = prompt_tokens.iter().map(|tokens| tokens.len()).sum();
     let seq_count = prompt_tokens.len();
     let seq_max = (seq_count + 1) as i32;
 
     for seq_id in 1..=seq_count {
-        state
-            .ctx
-            .copy_kv_cache_seq(0, seq_id as i32, None, None)
-            .ok();
+        state.ctx.copy_kv_cache_seq(0, seq_id as i32, None, None)?;
     }
 
     let mut batch = LlamaBatch::new(total_tokens, seq_max);
@@ -311,16 +335,14 @@ fn run_batch_with_tokens(
         for (token_index, token) in tokens.iter().enumerate() {
             let pos = prefix_len + token_index;
             let is_last = token_index + 1 == tokens.len();
-            batch
-                .add(*token, pos as i32, &[seq_id as i32], is_last)
-                .ok();
+            batch.add(*token, pos as i32, &[seq_id as i32], is_last)?;
         }
         let last_offset = offset + tokens.len().saturating_sub(1);
         logits_indices.push(last_offset as i32);
         offset += tokens.len();
     }
 
-    state.ctx.decode(&mut batch).ok();
+    state.ctx.decode(&mut batch)?;
 
     let mut output_tokens = vec![Vec::with_capacity(max_output_tokens); seq_count];
     let mut positions: Vec<i32> = prompt_tokens
@@ -331,18 +353,12 @@ fn run_batch_with_tokens(
     for _ in 0..max_output_tokens {
         if let Some(flag) = cancel_flag {
             if !flag.load(Ordering::SeqCst) {
-                clear_transient_sequences(state);
-                let outputs = output_tokens
-                    .iter()
-                    .map(|tokens| {
-                        state
-                            .model
-                            .tokens_to_str(tokens, Special::Plaintext)
-                            .unwrap_or_default()
-                            .trim()
-                            .to_string()
-                    })
-                    .collect();
+                clear_transient_sequences(state)?;
+                let mut outputs = Vec::with_capacity(output_tokens.len());
+                for tokens in &output_tokens {
+                    let text = state.model.tokens_to_str(tokens, Special::Plaintext)?;
+                    outputs.push(text.trim().to_string());
+                }
                 return Ok(outputs);
             }
         }
@@ -389,43 +405,33 @@ fn run_batch_with_tokens(
         let mut token_batch = LlamaBatch::new(active_indices.len(), seq_max);
         for (batch_index, seq_index) in active_indices.iter().enumerate() {
             let pos = positions[*seq_index];
-            token_batch
-                .add(
-                    next_tokens[batch_index],
-                    pos,
-                    &[*seq_index as i32 + 1],
-                    true,
-                )
-                .ok();
+            token_batch.add(
+                next_tokens[batch_index],
+                pos,
+                &[*seq_index as i32 + 1],
+                true,
+            )?;
             positions[*seq_index] += 1;
             logits_indices[*seq_index] = batch_index as i32;
         }
 
-        state.ctx.decode(&mut token_batch).ok();
+        state.ctx.decode(&mut token_batch)?;
     }
 
-    let outputs = output_tokens
-        .iter()
-        .map(|tokens| {
-            state
-                .model
-                .tokens_to_str(tokens, Special::Plaintext)
-                .unwrap_or_default()
-                .trim()
-                .to_string()
-        })
-        .collect();
+    let mut outputs = Vec::with_capacity(output_tokens.len());
+    for tokens in &output_tokens {
+        let text = state.model.tokens_to_str(tokens, Special::Plaintext)?;
+        outputs.push(text.trim().to_string());
+    }
 
     Ok(outputs)
 }
 
-fn init_state() -> LlamaState {
-    let backend = LlamaBackend::init().expect("llama backend init");
+fn init_state() -> Result<LlamaState, TranslateError> {
+    let backend = LlamaBackend::init()?;
     let model_params = LlamaModelParams::default();
-
-    let model = Box::new(
-        LlamaModel::load_from_file(&backend, &model_path(), &model_params).expect("load model"),
-    );
+    let model = LlamaModel::load_from_file(&backend, &model_path(), &model_params)?;
+    let model = Box::new(model);
 
     let ctx_params = LlamaContextParams::default()
         .with_n_ctx(NonZeroU32::new(CTX_SIZE))
@@ -436,14 +442,12 @@ fn init_state() -> LlamaState {
     // TODO: The model is stored in the same struct as the context, so the model will outlive the context. We use unsafe to extend the lifetime.
     let model_ref: &'static LlamaModel = unsafe { &*(&*model as *const LlamaModel) };
 
-    let ctx = model_ref
-        .new_context(&backend, ctx_params)
-        .expect("init context");
-    let stop_tokens = model
+    let ctx = model_ref.new_context(&backend, ctx_params)?;
+    let stop_tokens = model_ref
         .str_to_token(STOP_SEQUENCE, AddBos::Never)
         .unwrap_or_default();
 
-    LlamaState {
+    Ok(LlamaState {
         backend,
         model,
         ctx,
@@ -453,7 +457,7 @@ fn init_state() -> LlamaState {
         cached_prefix_len: 0,
         cached_prompt_suffix_len: 0,
         cached_prompt_suffix_tokens: Vec::new(),
-    }
+    })
 }
 
 fn ensure_suffix_cached(state: &mut LlamaState) {
@@ -469,10 +473,7 @@ fn ensure_suffix_cached(state: &mut LlamaState) {
     state.cached_prompt_suffix_tokens = suffix_tokens;
 }
 
-fn ensure_prefix_cached(
-    state: &mut LlamaState,
-    prompt_prefix: &str,
-) -> Result<usize, llama_cpp_2::LlamaCppError> {
+fn ensure_prefix_cached(state: &mut LlamaState, prompt_prefix: &str) -> TranslateResult<usize> {
     if state.cached_prefix.as_deref() == Some(prompt_prefix) {
         return Ok(state.cached_prefix_len);
     }
@@ -489,7 +490,7 @@ fn ensure_prefix_cached(
     let prefix_tokens_len = prefix_tokens.len();
     if prefix_tokens_len > 0 {
         let mut prefix_batch = LlamaBatch::new(prefix_tokens_len, 1);
-        prefix_batch.add_sequence(&prefix_tokens, 0, false).ok();
+        prefix_batch.add_sequence(&prefix_tokens, 0, false)?;
         state.ctx.decode(&mut prefix_batch)?;
     }
 
@@ -499,25 +500,26 @@ fn ensure_prefix_cached(
     Ok(prefix_tokens_len)
 }
 
-fn clear_transient_sequences(state: &mut LlamaState) {
+fn clear_transient_sequences(state: &mut LlamaState) -> TranslateResult<()> {
     let max_sequences = state.max_seq_batch.saturating_sub(1);
     for seq_id in 1..=max_sequences {
         state
             .ctx
-            .clear_kv_cache_seq(Some(seq_id as u32), None, None)
-            .ok();
+            .clear_kv_cache_seq(Some(seq_id as u32), None, None)?;
     }
+
+    Ok(())
 }
 
-fn build_prompt_prefix(source_locale: &str, target_locale: &str) -> String {
-    let (source_lang, source_code) = locale_to_lang(source_locale);
-    let (target_lang, target_code) = locale_to_lang(target_locale);
+fn build_prompt_prefix(source_locale: &str, target_locale: &str) -> Result<String, TranslateError> {
+    let (source_lang, source_code) = locale_to_lang(source_locale)?;
+    let (target_lang, target_code) = locale_to_lang(target_locale)?;
 
-    PROMPT_PREFIX_TEMPLATE
+    Ok(PROMPT_PREFIX_TEMPLATE
         .replace("{SOURCE_LANG}", source_lang.as_str())
         .replace("{SOURCE_CODE}", source_code.as_str())
         .replace("{TARGET_LANG}", target_lang.as_str())
-        .replace("{TARGET_CODE}", target_code.as_str())
+        .replace("{TARGET_CODE}", target_code.as_str()))
 }
 
 fn model_path() -> PathBuf {
@@ -659,6 +661,9 @@ fn split_text_to_fit(text: &str, state: &LlamaState, limits: &BatchLimits) -> Ve
         } else {
             let mut remaining = trimmed.to_string();
             while !remaining.is_empty() {
+                if max_text_tokens == 0 {
+                    return Vec::new();
+                }
                 let chunk = trim_to_fit(&remaining, state, max_text_tokens)
                     .unwrap_or_else(|| remaining.clone());
                 let chunk = chunk.trim();
@@ -666,6 +671,9 @@ fn split_text_to_fit(text: &str, state: &LlamaState, limits: &BatchLimits) -> Ve
                     break;
                 }
                 let chunk_len = token_len_cached(state, &mut token_len_cache, chunk);
+                if chunk_len > max_text_tokens {
+                    return Vec::new();
+                }
                 let chunk_tokens = tokenize_text(state, chunk);
                 sentences.push(TextChunk {
                     text: chunk.to_string(),
@@ -675,7 +683,6 @@ fn split_text_to_fit(text: &str, state: &LlamaState, limits: &BatchLimits) -> Ve
                 remaining = remaining[chunk.len()..].trim_start().to_string();
             }
             current.clear();
-            current_len = 0;
         }
     }
 
@@ -746,7 +753,7 @@ fn filter_single_word_output(output: &str) -> String {
     first_line.to_string()
 }
 
-fn locale_to_lang(locale: &str) -> (String, String) {
+fn locale_to_lang(locale: &str) -> Result<(String, String), TranslateError> {
     let normalized = locale.replace('_', "-");
     let base = normalized.split('-').next().unwrap_or(normalized.as_str());
 
@@ -912,10 +919,10 @@ fn locale_to_lang(locale: &str) -> (String, String) {
         "za" => "Zhuang",
         "zh" => "Chinese",
         "zu" => "Zulu",
-        _ => panic!("Unsupported locale: {}", locale),
+        _ => return Err(TranslateError::UnsupportedLocale(locale.to_string())),
     };
 
-    (language.to_string(), normalized)
+    Ok((language.to_string(), normalized))
 }
 
 fn tokens_end_with(tokens: &[LlamaToken], suffix: &[LlamaToken]) -> bool {

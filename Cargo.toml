@@ -10,6 +10,7 @@ llama-cpp-2 = { version = "0.1.132", features = ["metal"] }
 image = "^0.25"
 lol_html = "^1.2"
 zip = "^0.6"
+thiserror = "^2"
 
 [package.metadata.bundle]
 name = "Gemma EPUB Translator"

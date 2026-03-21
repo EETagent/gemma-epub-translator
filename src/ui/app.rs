@@ -28,6 +28,7 @@ pub enum AppMessage {
     TranslationComplete(Result<PathBuf, String>),
     CancelTranslation,
     ModelLoaded,
+    ModelLoadFailed(String),
 }
 
 pub struct TranslatorApp {
@@ -114,11 +115,17 @@ impl AppDelegate for TranslatorApp {
         self.epub_view.set_loading_model();
 
         let model_state_ref = self.model_state.clone();
-        std::thread::spawn(move || {
-            let state = create_state();
-            let state = Arc::new(Mutex::new(state));
-            *model_state_ref.lock().unwrap() = Some(state);
-            App::<TranslatorApp, AppMessage>::dispatch_main(AppMessage::ModelLoaded);
+        std::thread::spawn(move || match create_state() {
+            Ok(state) => {
+                let state = Arc::new(Mutex::new(state));
+                *model_state_ref.lock().unwrap() = Some(state);
+                App::<TranslatorApp, AppMessage>::dispatch_main(AppMessage::ModelLoaded);
+            }
+            Err(err) => {
+                App::<TranslatorApp, AppMessage>::dispatch_main(AppMessage::ModelLoadFailed(
+                    err.to_string(),
+                ));
+            }
         });
 
         self.window.set_minimum_content_size(520., 720.);
@@ -191,6 +198,9 @@ impl Dispatcher for TranslatorApp {
                 if let Some(state) = self.model_state.lock().unwrap().clone() {
                     self.epub_view.set_model_state(state);
                 }
+            }
+            AppMessage::ModelLoadFailed(err) => {
+                self.epub_view.set_model_load_error(&err);
             }
         }
     }

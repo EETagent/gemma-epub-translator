@@ -1,5 +1,5 @@
 use crate::epub_rebuild::{output_path_with_locale, rebuild_epub_with, RebuildError};
-use crate::translate::{translate_texts_with_cancel, LlamaState};
+use crate::translate::{translate_texts_with_cancel, LlamaState, TranslateError};
 use epub::doc::{DocError, EpubDoc};
 use lol_html::html_content::{ContentType, TextType};
 use lol_html::{element, text, HtmlRewriter, Settings};
@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 pub enum ProcessError {
     Doc(DocError),
     Rebuild(RebuildError),
+    Translate(TranslateError),
     Cancelled,
 }
 
@@ -24,6 +25,12 @@ impl From<DocError> for ProcessError {
 impl From<RebuildError> for ProcessError {
     fn from(err: RebuildError) -> Self {
         Self::Rebuild(err)
+    }
+}
+
+impl From<TranslateError> for ProcessError {
+    fn from(err: TranslateError) -> Self {
+        Self::Translate(err)
     }
 }
 
@@ -125,7 +132,7 @@ where
             source_locale,
             target_locale,
             cancel_flag.as_ref(),
-        );
+        )?;
 
         if let Some(ref flag) = cancel_flag {
             if !flag.load(Ordering::SeqCst) {
