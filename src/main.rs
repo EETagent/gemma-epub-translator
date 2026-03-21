@@ -1,5 +1,4 @@
-mod epub_processor;
-mod epub_rebuild;
+mod processors;
 mod translate;
 mod ui;
 

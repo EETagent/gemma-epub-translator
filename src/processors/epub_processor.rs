@@ -1,4 +1,4 @@
-use crate::epub_rebuild::{output_path_with_locale, rebuild_epub_with, RebuildError};
+use crate::processors::epub_rebuild::{output_path_with_locale, rebuild_epub_with, RebuildError};
 use crate::translate::{translate_texts_with_cancel, LlamaState, TranslateError};
 use epub::doc::{DocError, EpubDoc};
 use lol_html::html_content::{ContentType, TextType};

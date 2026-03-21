@@ -5,9 +5,7 @@ use cacao::control::Control;
 use cacao::dragdrop::{DragInfo, DragOperation};
 use cacao::filesystem::FileSelectPanel;
 use cacao::foundation::NSURL;
-use cacao::image::{Image, ImageView};
-use cacao::layout::Layout;
-use cacao::layout::LayoutConstraint;
+use cacao::layout::{Layout, LayoutConstraint};
 use cacao::objc_access::ObjcAccess;
 use cacao::pasteboard::PasteboardType;
 use cacao::progress::ProgressIndicator;
@@ -15,23 +13,21 @@ use cacao::select::Select;
 use cacao::text::{Font, Label, TextAlign};
 use cacao::url::Url;
 use cacao::view::{View, ViewDelegate};
-use epub::doc::EpubDoc;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use crate::epub_processor::{extract_text_segments, translate_epub_with_cancel, ProcessError};
+use crate::processors::srt_processor::{translate_srt_with_cancel, SrtProcessError};
 use crate::translate::LlamaState;
-use crate::ui::app::{AppMessage, TranslatorApp};
+use crate::ui::app::{AppMessage, TranslationKind, TranslatorApp};
 
 struct SharedUi {
     content: View,
     label_title: Label,
-    img_cover: ImageView,
     source_lang_select: Select,
     lang_select: Select,
     btn_open: Button,
@@ -39,7 +35,6 @@ struct SharedUi {
     btn_cancel: Button,
     progress_bar: ProgressIndicator,
     status_label: Label,
-    cover_image: Option<Image>,
     current_path: Option<PathBuf>,
     pending_paths: VecDeque<QueuedTranslation>,
     is_translating: Arc<AtomicBool>,
@@ -52,15 +47,13 @@ impl SharedUi {
         Self {
             content: View::default(),
             label_title: Label::default(),
-            img_cover: ImageView::default(),
             source_lang_select: Select::new(),
             lang_select: Select::new(),
-            btn_open: Button::new("Open EPUB..."),
+            btn_open: Button::new("Open SRT..."),
             btn_translate: Button::new("Translate"),
             btn_cancel: Button::new("Cancel"),
             progress_bar: ProgressIndicator::default(),
             status_label: Label::default(),
-            cover_image: None,
             current_path: None,
             pending_paths: VecDeque::new(),
             is_translating: Arc::new(AtomicBool::new(false)),
@@ -77,26 +70,13 @@ struct QueuedTranslation {
     target_locale: String,
 }
 
-pub struct EpubView {
+pub struct SrtView {
     view: View<ContentView>,
     ui: Rc<RefCell<SharedUi>>,
 }
 
 pub struct ContentView {
     ui: Rc<RefCell<SharedUi>>,
-}
-
-impl ContentView {
-    fn epub_paths_from_drag(info: &DragInfo) -> Vec<PathBuf> {
-        let pasteboard = info.get_pasteboard();
-        let Some(urls) = pasteboard.get_file_urls().ok() else {
-            return Vec::new();
-        };
-        urls.into_iter()
-            .map(|url| url.pathbuf())
-            .filter(is_epub_path)
-            .collect()
-    }
 }
 
 const SOURCE_LANGUAGES: &[(&str, &str)] = &[
@@ -112,59 +92,65 @@ const SOURCE_LANGUAGES: &[(&str, &str)] = &[
 
 const TARGET_LANGUAGES: &[(&str, &str)] = &[("Czech", "cs"), ("English", "en-US")];
 
+impl ContentView {
+    fn srt_paths_from_drag(info: &DragInfo) -> Vec<PathBuf> {
+        let pasteboard = info.get_pasteboard();
+        let Some(urls) = pasteboard.get_file_urls().ok() else {
+            return Vec::new();
+        };
+        urls.into_iter()
+            .map(|url| url.pathbuf())
+            .filter(is_srt_path)
+            .collect()
+    }
+}
+
 impl ViewDelegate for ContentView {
-    const NAME: &'static str = "EpubViewContent";
+    const NAME: &'static str = "SrtViewContent";
 
     fn did_load(&mut self, view: View) {
         view.register_for_dragged_types(&[PasteboardType::FileURL]);
-
         let mut ui = self.ui.borrow_mut();
 
-        ui.content.set_background_color(Color::rgb(245, 244, 241));
-
-        ui.img_cover.layer.set_corner_radius(12.0);
-
-        ui.label_title.set_text("Select an EPUB to begin");
+        ui.content.set_background_color(Color::rgb(241, 245, 244));
+        ui.label_title.set_text("Select an SRT file to begin");
         ui.label_title.set_text_alignment(TextAlign::Center);
         ui.label_title.set_font(Font::bold_system(18.0));
         ui.label_title.set_text_color(Color::Label);
 
-        for &(lang_name, _lang_code) in SOURCE_LANGUAGES {
-            ui.source_lang_select.add_item(lang_name);
+        for &(name, _) in SOURCE_LANGUAGES {
+            ui.source_lang_select.add_item(name);
         }
         ui.source_lang_select.set_selected_index(0);
-
-        for &(lang_name, _lang_code) in TARGET_LANGUAGES {
-            ui.lang_select.add_item(lang_name);
+        for &(name, _) in TARGET_LANGUAGES {
+            ui.lang_select.add_item(name);
         }
         ui.lang_select.set_selected_index(0);
 
         ui.btn_open.set_bezel_style(BezelStyle::Rounded);
         ui.btn_open.set_action(|_| {
-            App::<TranslatorApp, AppMessage>::dispatch_main(AppMessage::ShowOpenPanel);
+            App::<TranslatorApp, AppMessage>::dispatch_main(AppMessage::ShowOpenPanel(
+                TranslationKind::Srt,
+            ));
         });
 
         ui.btn_translate.set_bezel_style(BezelStyle::Rounded);
         ui.btn_translate.set_hidden(true);
-        ui.btn_translate.set_action(|_| {
-            // Will be handled by starting translation
-        });
-
         ui.btn_cancel.set_bezel_style(BezelStyle::Rounded);
         ui.btn_cancel.set_hidden(true);
         ui.btn_cancel.set_action(|_| {
-            App::<TranslatorApp, AppMessage>::dispatch_main(AppMessage::CancelTranslation);
+            App::<TranslatorApp, AppMessage>::dispatch_main(AppMessage::CancelTranslation(
+                TranslationKind::Srt,
+            ));
         });
 
         ui.progress_bar.set_hidden(true);
         ui.progress_bar.set_indeterminate(false);
         ui.progress_bar.set_value(0.0);
-
         ui.status_label.set_text("");
         ui.status_label.set_text_alignment(TextAlign::Center);
         ui.status_label.set_text_color(Color::LabelSecondary);
 
-        ui.content.add_subview(&ui.img_cover);
         ui.content.add_subview(&ui.label_title);
         ui.content.add_subview(&ui.source_lang_select);
         ui.content.add_subview(&ui.lang_select);
@@ -176,19 +162,10 @@ impl ViewDelegate for ContentView {
         view.add_subview(&ui.content);
 
         LayoutConstraint::activate(&[
-            ui.img_cover
-                .top
-                .constraint_equal_to(&ui.content.safe_layout_guide.top)
-                .offset(32.),
-            ui.img_cover
-                .center_x
-                .constraint_equal_to(&ui.content.center_x),
-            ui.img_cover.width.constraint_equal_to_constant(180.),
-            ui.img_cover.height.constraint_equal_to_constant(240.),
             ui.label_title
                 .top
-                .constraint_equal_to(&ui.img_cover.bottom)
-                .offset(18.),
+                .constraint_equal_to(&ui.content.safe_layout_guide.top)
+                .offset(64.),
             ui.label_title
                 .leading
                 .constraint_equal_to(&ui.content.leading)
@@ -200,7 +177,7 @@ impl ViewDelegate for ContentView {
             ui.source_lang_select
                 .top
                 .constraint_equal_to(&ui.label_title.bottom)
-                .offset(12.),
+                .offset(16.),
             ui.source_lang_select
                 .center_x
                 .constraint_equal_to(&ui.content.center_x),
@@ -252,9 +229,6 @@ impl ViewDelegate for ContentView {
                 .trailing
                 .constraint_equal_to(&ui.content.trailing)
                 .offset(-24.),
-        ]);
-
-        LayoutConstraint::activate(&[
             ui.content
                 .top
                 .constraint_equal_to(&view.safe_layout_guide.top),
@@ -271,7 +245,7 @@ impl ViewDelegate for ContentView {
     }
 
     fn dragging_entered(&self, info: DragInfo) -> DragOperation {
-        if Self::epub_paths_from_drag(&info).is_empty() {
+        if Self::srt_paths_from_drag(&info).is_empty() {
             DragOperation::None
         } else {
             DragOperation::Copy
@@ -279,23 +253,25 @@ impl ViewDelegate for ContentView {
     }
 
     fn prepare_for_drag_operation(&self, info: DragInfo) -> bool {
-        !Self::epub_paths_from_drag(&info).is_empty()
+        !Self::srt_paths_from_drag(&info).is_empty()
     }
 
     fn perform_drag_operation(&self, info: DragInfo) -> bool {
-        let paths = Self::epub_paths_from_drag(&info);
+        let paths = Self::srt_paths_from_drag(&info);
         if paths.is_empty() {
-            false
-        } else {
-            for path in paths {
-                App::<TranslatorApp, AppMessage>::dispatch_main(AppMessage::OpenFile(path));
-            }
-            true
+            return false;
         }
+        for path in paths {
+            App::<TranslatorApp, AppMessage>::dispatch_main(AppMessage::OpenFile {
+                kind: TranslationKind::Srt,
+                path,
+            });
+        }
+        true
     }
 }
 
-impl EpubView {
+impl SrtView {
     pub fn new() -> Self {
         let ui = Rc::new(RefCell::new(SharedUi::new()));
         Self {
@@ -308,7 +284,7 @@ impl EpubView {
         let mut ui = self.ui.borrow_mut();
         ui.model_state = Some(state);
         ui.status_label
-            .set_text("Model loaded. Ready to translate.");
+            .set_text("Model loaded. Ready to translate SRT.");
         ui.btn_translate.set_enabled(true);
     }
 
@@ -330,10 +306,6 @@ impl EpubView {
         ui.btn_translate.set_enabled(false);
     }
 
-    pub fn view(&self) -> &View<ContentView> {
-        &self.view
-    }
-
     pub fn view_id(&self) -> cacao::foundation::id {
         self.view
             .get_from_backing_obj(|obj| obj as *const _ as cacao::foundation::id)
@@ -345,30 +317,40 @@ impl EpubView {
 
     pub fn present_open_panel(&self) {
         let mut panel = FileSelectPanel::new();
-        panel.set_message("Choose an EPUB file");
+        panel.set_message("Choose SRT subtitle files");
         panel.set_allows_multiple_selection(true);
         panel.set_can_choose_directories(false);
         panel.set_can_choose_files(true);
         panel.show(|urls| {
-            let paths = epub_paths_from_nsurls(&urls);
+            let paths = srt_paths_from_nsurls(&urls);
             for path in paths {
-                App::<TranslatorApp, AppMessage>::dispatch_main(AppMessage::OpenFile(path));
+                App::<TranslatorApp, AppMessage>::dispatch_main(AppMessage::OpenFile {
+                    kind: TranslationKind::Srt,
+                    path,
+                });
             }
         });
     }
 
+    pub fn open_urls(&self, urls: Vec<Url>) {
+        for path in srt_paths_from_urls(&urls) {
+            App::<TranslatorApp, AppMessage>::dispatch_main(AppMessage::OpenFile {
+                kind: TranslationKind::Srt,
+                path,
+            });
+        }
+    }
+
     pub fn handle_open_file(&self, path: PathBuf) {
-        if !is_epub_path(&path) {
-            let ui = self.ui.borrow_mut();
-            ui.status_label.set_text("Please select an .epub file.");
+        if !is_srt_path(&path) {
+            self.ui
+                .borrow()
+                .status_label
+                .set_text("Please select an .srt file.");
             return;
         }
 
-        let should_queue = {
-            let ui = self.ui.borrow();
-            ui.is_translating.load(Ordering::SeqCst)
-        };
-
+        let should_queue = self.ui.borrow().is_translating.load(Ordering::SeqCst);
         if should_queue {
             let mut ui = self.ui.borrow_mut();
             let (source_locale, target_locale) = selected_locales(&ui);
@@ -377,10 +359,8 @@ impl EpubView {
                 source_locale,
                 target_locale,
             });
-            let queued = ui.pending_paths.len();
-            let suffix = if queued == 1 { "" } else { "s" };
             ui.status_label
-                .set_text(&format!("Queued {queued} EPUB{suffix}."));
+                .set_text(&format!("Queued {} SRT file(s).", ui.pending_paths.len()));
             return;
         }
 
@@ -391,41 +371,28 @@ impl EpubView {
         self.start_translation_for_path(path, source_locale, target_locale);
     }
 
-    pub fn open_urls(&self, urls: Vec<Url>) {
-        for path in epub_paths_from_urls(&urls) {
-            App::<TranslatorApp, AppMessage>::dispatch_main(AppMessage::OpenFile(path));
-        }
-    }
-
     pub fn handle_progress(&self, completed: usize, total: usize) {
         let ui = self.ui.borrow_mut();
-        let queued = ui.pending_paths.len();
         let percentage = if total > 0 {
             (completed as f64 / total as f64) * 100.0
         } else {
             0.0
         };
-        let remaining_text = if completed >= 5 {
+        let eta = if completed >= 5 {
             let elapsed = ui
                 .translation_started_at
                 .map(|start| start.elapsed().as_secs_f64())
                 .unwrap_or_default();
-            let per_segment = elapsed / completed as f64;
-            let remaining = (total.saturating_sub(completed)) as f64 * per_segment;
-            let minutes = (remaining / 60.0).ceil() as u64;
-            format!(" — ~{} min left", minutes.max(1))
+            let per_unit = elapsed / completed as f64;
+            let remaining = (total.saturating_sub(completed)) as f64 * per_unit;
+            format!(" — ~{} min left", (remaining / 60.0).ceil().max(1.0) as u64)
         } else {
             String::new()
         };
         ui.progress_bar.set_value(percentage);
-        let queued_text = if queued > 0 {
-            format!(" — {queued} queued")
-        } else {
-            String::new()
-        };
         ui.status_label.set_text(&format!(
-            "Translating... {}/{} segments ({:.0}%){}{}",
-            completed, total, percentage, remaining_text, queued_text
+            "Translating... {}/{} subtitle lines ({:.0}%){}",
+            completed, total, percentage, eta
         ));
     }
 
@@ -436,17 +403,12 @@ impl EpubView {
             ui.btn_cancel.set_hidden(true);
             ui.progress_bar.set_value(100.0);
             ui.translation_started_at = None;
-
             match result {
-                Ok(path) => {
-                    ui.status_label
-                        .set_text(&format!("✓ Saved to {}", path.display()));
-                }
-                Err(err) => {
-                    ui.status_label.set_text(&format!("✗ Error: {}", err));
-                }
+                Ok(path) => ui
+                    .status_label
+                    .set_text(&format!("✓ Saved to {}", path.display())),
+                Err(err) => ui.status_label.set_text(&format!("✗ Error: {}", err)),
             }
-
             ui.pending_paths.pop_front()
         };
 
@@ -472,128 +434,46 @@ impl EpubView {
         target_locale: String,
     ) {
         let mut ui = self.ui.borrow_mut();
-        let mut opened = true;
+        ui.current_path = Some(path.clone());
+        let name = path
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or("subtitle.srt");
+        ui.label_title.set_text(&format!("Translating {name}"));
+        ui.progress_bar.set_hidden(false);
+        ui.progress_bar.set_value(0.0);
+        ui.btn_translate.set_hidden(true);
+        ui.btn_cancel.set_hidden(false);
+        ui.is_translating.store(true, Ordering::SeqCst);
+        ui.translation_started_at = Some(Instant::now());
 
-        match EpubDoc::new(&path) {
-            Ok(mut doc) => {
-                let title = doc
-                    .get_title()
-                    .unwrap_or_else(|| "Untitled EPUB".to_string());
-                ui.label_title.set_text(&title);
-
-                if let Some((cover_data, _mime)) = doc.get_cover() {
-                    let image = Image::with_data(&cover_data);
-                    ui.img_cover.set_image(&image);
-                    ui.cover_image = Some(image);
-                    ui.img_cover.set_background_color(Color::Clear);
-                } else {
-                    ui.img_cover.set_background_color(Color::rgb(220, 220, 220));
-                }
-
-                ui.current_path = Some(path.clone());
-            }
-            Err(err) => {
-                ui.status_label
-                    .set_text(&format!("Failed to open EPUB: {err}"));
-                opened = false;
-            }
-        }
-
+        let Some(model_state) = ui.model_state.clone() else {
+            ui.status_label
+                .set_text("Model not loaded yet. Please wait...");
+            ui.is_translating.store(false, Ordering::SeqCst);
+            ui.btn_cancel.set_hidden(true);
+            return;
+        };
         drop(ui);
 
-        if opened {
-            self.analyze_and_start_translation(&path, source_locale, target_locale);
-        } else {
-            self.start_next_from_queue();
-        }
-    }
-
-    fn start_next_from_queue(&self) {
-        let next = {
-            let mut ui = self.ui.borrow_mut();
-            ui.pending_paths.pop_front()
-        };
-
-        if let Some(next) = next {
-            self.start_translation_for_path(next.path, next.source_locale, next.target_locale);
-        }
-    }
-
-    fn analyze_and_start_translation(
-        &self,
-        path: &PathBuf,
-        source_locale: String,
-        target_locale: String,
-    ) {
-        let model_state = {
-            let ui = self.ui.borrow();
-            match &ui.model_state {
-                Some(state) => state.clone(),
-                None => {
-                    drop(ui);
-                    let ui = self.ui.borrow_mut();
-                    ui.status_label
-                        .set_text("Model not loaded yet. Please wait...");
-                    return;
-                }
-            }
-        };
-
-        let segments = match extract_text_segments(path) {
-            Ok(result) => result,
-            Err(err) => {
-                let ui = self.ui.borrow_mut();
-                ui.status_label
-                    .set_text(&format!("Failed to parse EPUB: {err:?}"));
-                return;
-            }
-        };
-
-        let segment_count = segments.segments.len();
-        let word_count = segments.total_words;
-
-        {
-            let mut ui = self.ui.borrow_mut();
-            ui.status_label.set_text(&format!(
-                "Found {} segments ({} words). Starting translation...",
-                segment_count, word_count
-            ));
-            ui.progress_bar.set_hidden(false);
-            ui.progress_bar.set_value(0.0);
-            ui.btn_translate.set_hidden(true);
-            ui.btn_cancel.set_hidden(false);
-            ui.is_translating.store(true, Ordering::SeqCst);
-            ui.translation_started_at = Some(Instant::now());
-        }
-
-        let path = path.clone();
         let is_translating = self.ui.borrow().is_translating.clone();
-
+        let is_translating_for_progress = is_translating.clone();
         std::thread::spawn(move || {
-            let completed = Arc::new(AtomicUsize::new(0));
-            let total = Arc::new(AtomicUsize::new(segment_count));
-            let completed_clone = completed.clone();
-            let total_clone = total.clone();
-            let is_translating_clone = is_translating.clone();
             let cancel_flag = is_translating.clone();
-
-            let result = translate_epub_with_cancel(
+            let result = translate_srt_with_cancel(
                 &model_state,
                 &path,
                 &source_locale,
                 &target_locale,
-                move |done, t| {
-                    if !is_translating_clone.load(Ordering::SeqCst) {
+                move |done, total| {
+                    if !is_translating_for_progress.load(Ordering::SeqCst) {
                         return;
                     }
-
-                    completed_clone.store(done, Ordering::SeqCst);
-                    total_clone.store(t, Ordering::SeqCst);
-
                     App::<TranslatorApp, AppMessage>::dispatch_main(
                         AppMessage::TranslationProgress {
+                            kind: TranslationKind::Srt,
                             completed: done,
-                            total: t,
+                            total,
                         },
                     );
                 },
@@ -605,33 +485,39 @@ impl EpubView {
             }
 
             let message = match result {
-                Ok(path) => AppMessage::TranslationComplete(Ok(path)),
-                Err(ProcessError::Cancelled) => return, // Silently exit on cancellation
-                Err(err) => AppMessage::TranslationComplete(Err(format!("{:?}", err))),
+                Ok(path) => AppMessage::TranslationComplete {
+                    kind: TranslationKind::Srt,
+                    result: Ok(path),
+                },
+                Err(SrtProcessError::Cancelled) => return,
+                Err(err) => AppMessage::TranslationComplete {
+                    kind: TranslationKind::Srt,
+                    result: Err(format!("{:?}", err)),
+                },
             };
             App::<TranslatorApp, AppMessage>::dispatch_main(message);
         });
     }
 }
 
-fn is_epub_path(path: &PathBuf) -> bool {
+fn is_srt_path(path: &PathBuf) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
-        .map(|ext| ext.eq_ignore_ascii_case("epub"))
+        .map(|ext| ext.eq_ignore_ascii_case("srt"))
         .unwrap_or(false)
 }
 
-fn epub_paths_from_urls(urls: &[Url]) -> Vec<PathBuf> {
+fn srt_paths_from_urls(urls: &[Url]) -> Vec<PathBuf> {
     urls.iter()
         .filter_map(|url| url.to_file_path().ok())
-        .filter(is_epub_path)
+        .filter(is_srt_path)
         .collect()
 }
 
-fn epub_paths_from_nsurls(urls: &[NSURL]) -> Vec<PathBuf> {
+fn srt_paths_from_nsurls(urls: &[NSURL]) -> Vec<PathBuf> {
     urls.iter()
         .map(|url| url.pathbuf())
-        .filter(is_epub_path)
+        .filter(is_srt_path)
         .collect()
 }
 
@@ -640,11 +526,9 @@ fn selected_locales(ui: &SharedUi) -> (String, String) {
         .get(ui.source_lang_select.get_selected_index())
         .map(|&(_, code)| code)
         .unwrap_or("en-US");
-
     let target = TARGET_LANGUAGES
         .get(ui.lang_select.get_selected_index())
         .map(|&(_, code)| code)
         .unwrap_or("cs");
-
     (source.to_string(), target.to_string())
 }

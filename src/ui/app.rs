@@ -17,16 +17,33 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::translate::{create_state, LlamaState};
-use crate::ui::epub_view::EpubView;
 use crate::ui::mycacao::alert::Alert;
+use crate::ui::views::epub_view::EpubView;
+use crate::ui::views::srt_view::SrtView;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranslationKind {
+    Epub,
+    Srt,
+}
 
 #[derive(Debug)]
 pub enum AppMessage {
-    ShowOpenPanel,
-    OpenFile(PathBuf),
-    TranslationProgress { completed: usize, total: usize },
-    TranslationComplete(Result<PathBuf, String>),
-    CancelTranslation,
+    ShowOpenPanel(TranslationKind),
+    OpenFile {
+        kind: TranslationKind,
+        path: PathBuf,
+    },
+    TranslationProgress {
+        kind: TranslationKind,
+        completed: usize,
+        total: usize,
+    },
+    TranslationComplete {
+        kind: TranslationKind,
+        result: Result<PathBuf, String>,
+    },
+    CancelTranslation(TranslationKind),
     ModelLoaded,
     ModelLoadFailed(String),
 }
@@ -36,18 +53,22 @@ pub struct TranslatorApp {
     content_view: View,
     tab_view: TabView,
     epub_view: EpubView,
+    srt_view: SrtView,
     model_state: Arc<Mutex<Option<Arc<Mutex<LlamaState>>>>>,
 }
 
 struct AppWindowDelegate {
-    is_translating: Arc<AtomicBool>,
+    is_translating_epub: Arc<AtomicBool>,
+    is_translating_srt: Arc<AtomicBool>,
 }
 
 impl WindowDelegate for AppWindowDelegate {
     const NAME: &'static str = "TranslatorWindowDelegate";
 
     fn should_close(&self) -> bool {
-        if !self.is_translating.load(Ordering::SeqCst) {
+        if !self.is_translating_epub.load(Ordering::SeqCst)
+            && !self.is_translating_srt.load(Ordering::SeqCst)
+        {
             return true;
         }
 
@@ -57,7 +78,12 @@ impl WindowDelegate for AppWindowDelegate {
         );
         let result = alert.show_with_cancel("Close", "Cancel");
         if result.confirmed {
-            App::<TranslatorApp, AppMessage>::dispatch_main(AppMessage::CancelTranslation);
+            App::<TranslatorApp, AppMessage>::dispatch_main(AppMessage::CancelTranslation(
+                TranslationKind::Epub,
+            ));
+            App::<TranslatorApp, AppMessage>::dispatch_main(AppMessage::CancelTranslation(
+                TranslationKind::Srt,
+            ));
             true
         } else {
             false
@@ -70,8 +96,10 @@ impl TranslatorApp {
         let content_view = View::new();
         let tab_view = TabView::new();
         let epub_view = EpubView::new();
+        let srt_view = SrtView::new();
         let window_delegate = AppWindowDelegate {
-            is_translating: epub_view.is_translating_flag(),
+            is_translating_epub: epub_view.is_translating_flag(),
+            is_translating_srt: srt_view.is_translating_flag(),
         };
 
         let app = Self {
@@ -79,6 +107,7 @@ impl TranslatorApp {
             content_view,
             tab_view,
             epub_view,
+            srt_view,
             model_state: Arc::new(Mutex::new(None)),
         };
 
@@ -91,7 +120,12 @@ impl TranslatorApp {
         epub_tab.set_label("EPUB");
         set_tab_view_item_view(&epub_tab, self.epub_view.view_id());
 
+        let mut srt_tab = TabViewItem::new("srt");
+        srt_tab.set_label("SRT");
+        set_tab_view_item_view(&srt_tab, self.srt_view.view_id());
+
         self.tab_view.add_tab_view_item(epub_tab);
+        self.tab_view.add_tab_view_item(srt_tab);
 
         self.tab_view.select_tab_view_item_with_identifier("epub");
     }
@@ -113,6 +147,7 @@ impl AppDelegate for TranslatorApp {
         App::activate();
 
         self.epub_view.set_loading_model();
+        self.srt_view.set_loading_model();
 
         let model_state_ref = self.model_state.clone();
         std::thread::spawn(move || match create_state() {
@@ -155,12 +190,16 @@ impl AppDelegate for TranslatorApp {
     }
 
     fn will_terminate(&self) {
-        if self.epub_view.is_translating_flag().load(Ordering::SeqCst) {
+        if self.epub_view.is_translating_flag().load(Ordering::SeqCst)
+            || self.srt_view.is_translating_flag().load(Ordering::SeqCst)
+        {
             self.epub_view.handle_cancel();
+            self.srt_view.handle_cancel();
             std::thread::sleep(std::time::Duration::from_millis(750));
         }
 
         self.epub_view.clear_model_state();
+        self.srt_view.clear_model_state();
 
         if let Ok(mut lock) = self.model_state.lock() {
             *lock = None;
@@ -170,7 +209,8 @@ impl AppDelegate for TranslatorApp {
     }
 
     fn open_urls(&self, urls: Vec<Url>) {
-        self.epub_view.open_urls(urls);
+        self.epub_view.open_urls(urls.clone());
+        self.srt_view.open_urls(urls);
     }
 }
 
@@ -185,22 +225,39 @@ impl Dispatcher for TranslatorApp {
 
     fn on_ui_message(&self, message: Self::Message) {
         match message {
-            AppMessage::ShowOpenPanel => self.epub_view.present_open_panel(),
-            AppMessage::OpenFile(path) => self.epub_view.handle_open_file(path),
-            AppMessage::TranslationProgress { completed, total } => {
-                self.epub_view.handle_progress(completed, total);
-            }
-            AppMessage::TranslationComplete(result) => {
-                self.epub_view.handle_completion(result);
-            }
-            AppMessage::CancelTranslation => self.epub_view.handle_cancel(),
+            AppMessage::ShowOpenPanel(kind) => match kind {
+                TranslationKind::Epub => self.epub_view.present_open_panel(),
+                TranslationKind::Srt => self.srt_view.present_open_panel(),
+            },
+            AppMessage::OpenFile { kind, path } => match kind {
+                TranslationKind::Epub => self.epub_view.handle_open_file(path),
+                TranslationKind::Srt => self.srt_view.handle_open_file(path),
+            },
+            AppMessage::TranslationProgress {
+                kind,
+                completed,
+                total,
+            } => match kind {
+                TranslationKind::Epub => self.epub_view.handle_progress(completed, total),
+                TranslationKind::Srt => self.srt_view.handle_progress(completed, total),
+            },
+            AppMessage::TranslationComplete { kind, result } => match kind {
+                TranslationKind::Epub => self.epub_view.handle_completion(result),
+                TranslationKind::Srt => self.srt_view.handle_completion(result),
+            },
+            AppMessage::CancelTranslation(kind) => match kind {
+                TranslationKind::Epub => self.epub_view.handle_cancel(),
+                TranslationKind::Srt => self.srt_view.handle_cancel(),
+            },
             AppMessage::ModelLoaded => {
                 if let Some(state) = self.model_state.lock().unwrap().clone() {
-                    self.epub_view.set_model_state(state);
+                    self.epub_view.set_model_state(state.clone());
+                    self.srt_view.set_model_state(state);
                 }
             }
             AppMessage::ModelLoadFailed(err) => {
                 self.epub_view.set_model_load_error(&err);
+                self.srt_view.set_model_load_error(&err);
             }
         }
     }
@@ -227,7 +284,17 @@ pub fn app_menus() -> Vec<Menu> {
                     .key("o")
                     .modifiers(&[EventModifierFlag::Command])
                     .action(|| {
-                        App::<TranslatorApp, AppMessage>::dispatch_main(AppMessage::ShowOpenPanel);
+                        App::<TranslatorApp, AppMessage>::dispatch_main(AppMessage::ShowOpenPanel(
+                            TranslationKind::Epub,
+                        ));
+                    }),
+                MenuItem::new("Open SRT...")
+                    .key("o")
+                    .modifiers(&[EventModifierFlag::Command, EventModifierFlag::Shift])
+                    .action(|| {
+                        App::<TranslatorApp, AppMessage>::dispatch_main(AppMessage::ShowOpenPanel(
+                            TranslationKind::Srt,
+                        ));
                     }),
                 MenuItem::Separator,
                 MenuItem::CloseWindow,
