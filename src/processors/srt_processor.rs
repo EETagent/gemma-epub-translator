@@ -13,8 +13,6 @@ pub enum SrtProcessError {
     InvalidFormat(String),
     #[error(transparent)]
     Translate(#[from] crate::translate::TranslateError),
-    #[error("translation output could not be parsed")]
-    InvalidModelOutput,
     #[error("subtitle index/timing row is malformed")]
     MalformedCue,
     #[error("translation cancelled")]
@@ -98,12 +96,8 @@ where
                 split_translated_lines(&value, cue_line_count(&cues[cue_ctx.cue_index]))
             });
 
-            let translated_lines = match parsed {
-                Some(lines) => lines,
-                None => {
-                    return Err(SrtProcessError::InvalidModelOutput);
-                }
-            };
+            let translated_lines =
+                parsed.unwrap_or_else(|| cues[cue_ctx.cue_index].text_lines.clone());
             translated_cues[start + offset] = Some(translated_lines);
             done += 1;
             on_progress(done, total);
@@ -253,7 +247,7 @@ fn extract_current_translation(raw: &str) -> Option<String> {
         }
     }
 
-    None
+    Some(trimmed.to_string())
 }
 
 fn apply_translations(
