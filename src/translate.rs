@@ -7,6 +7,7 @@ use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::token::data::LlamaTokenData;
 use llama_cpp_2::token::data_array::LlamaTokenDataArray;
 use llama_cpp_2::token::LlamaToken;
+use std::collections::HashMap;
 use std::env;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
@@ -39,6 +40,7 @@ pub struct LlamaState {
     cached_prefix: Option<String>,
     cached_prefix_len: usize,
     cached_prompt_suffix_len: usize,
+    cached_prompt_suffix_tokens: Vec<LlamaToken>,
 }
 
 unsafe impl Send for LlamaState {}
@@ -83,7 +85,13 @@ pub struct BatchLimits {
 
 struct TextChunk {
     text: String,
+    tokens: Vec<LlamaToken>,
     tokens_len: usize,
+}
+
+struct PreparedPrompt {
+    key: PromptKey,
+    prompt_tokens: Vec<LlamaToken>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -113,7 +121,7 @@ pub fn translate_texts_with_cancel(
         max_sequences: state.max_seq_batch.saturating_sub(1),
     };
     let mut outputs = vec![String::new(); texts.len()];
-    let mut prompts = Vec::new();
+    let mut prompts: Vec<PreparedPrompt> = Vec::new();
     let mut chunk_results: Vec<Vec<Option<String>>> = vec![Vec::new(); texts.len()];
     let prompt_prefix = build_prompt_prefix(source_locale, target_locale);
 
@@ -137,15 +145,17 @@ pub fn translate_texts_with_cancel(
         for (chunk_index, chunk) in chunks.into_iter().enumerate() {
             let is_short_input = is_short_input_text_with_len(chunk.tokens_len);
             let is_single_word = is_single_word_input(&chunk.text);
-            prompts.push((
-                PromptKey {
+            let mut prompt_tokens = chunk.tokens;
+            prompt_tokens.extend_from_slice(&state.cached_prompt_suffix_tokens);
+            prompts.push(PreparedPrompt {
+                key: PromptKey {
                     parent_index: index,
                     chunk_index,
                     is_short_input,
                     is_single_word,
                 },
-                chunk.text,
-            ));
+                prompt_tokens,
+            });
         }
     }
 
@@ -164,8 +174,8 @@ pub fn translate_texts_with_cancel(
             }
         }
         Err(_) => {
-            for (key, _) in prompts {
-                outputs[key.parent_index] = texts[key.parent_index].to_string();
+            for prompt in &prompts {
+                outputs[prompt.key.parent_index] = texts[prompt.key.parent_index].to_string();
             }
         }
     }
@@ -193,7 +203,7 @@ pub fn translate_texts_with_cancel(
 
 fn run_batch_inference(
     state: &mut LlamaState,
-    prompts: &[(PromptKey, String)],
+    prompts: &[PreparedPrompt],
     cancel_flag: Option<&Arc<AtomicBool>>,
 ) -> Result<Vec<(PromptKey, String)>, llama_cpp_2::LlamaCppError> {
     let max_batch = state.ctx.n_batch() as usize;
@@ -216,19 +226,15 @@ fn run_batch_inference(
         let mut token_count = 0usize;
 
         while index < prompts.len() {
-            let prompt = format!("{}{}", prompts[index].1, PROMPT_SUFFIX);
-            let tokens = state
-                .model
-                .str_to_token(&prompt, AddBos::Never)
-                .unwrap_or_default();
-            if tokens.is_empty() {
-                results.push((prompts[index].0, String::new()));
+            let prompt = &prompts[index];
+            if prompt.prompt_tokens.is_empty() {
+                results.push((prompt.key, String::new()));
                 index += 1;
                 continue;
             }
 
-            let token_len = tokens.len();
-            let prompt_max_output = if prompts[index].0.is_short_input {
+            let token_len = prompt.prompt_tokens.len();
+            let prompt_max_output = if prompt.key.is_short_input {
                 SHORT_OUTPUT_TOKENS
             } else {
                 MAX_OUTPUT_TOKENS
@@ -250,8 +256,8 @@ fn run_batch_inference(
             }
 
             token_count += token_len;
-            batch_indices.push(prompts[index].0);
-            batch_tokens.push(tokens);
+            batch_indices.push(prompt.key);
+            batch_tokens.push(prompt.prompt_tokens.clone());
             index += 1;
         }
 
@@ -459,11 +465,12 @@ fn init_state() -> LlamaState {
         cached_prefix: None,
         cached_prefix_len: 0,
         cached_prompt_suffix_len: 0,
+        cached_prompt_suffix_tokens: Vec::new(),
     }
 }
 
 fn ensure_suffix_cached(state: &mut LlamaState) {
-    if state.cached_prompt_suffix_len > 0 {
+    if !state.cached_prompt_suffix_tokens.is_empty() {
         return;
     }
 
@@ -472,6 +479,7 @@ fn ensure_suffix_cached(state: &mut LlamaState) {
         .str_to_token(PROMPT_SUFFIX, AddBos::Never)
         .unwrap_or_default();
     state.cached_prompt_suffix_len = suffix_tokens.len();
+    state.cached_prompt_suffix_tokens = suffix_tokens;
 }
 
 fn ensure_prefix_cached(
@@ -570,35 +578,48 @@ fn split_into_sentences(text: &str) -> Vec<String> {
     sentences
 }
 
-fn text_token_len(state: &LlamaState, text: &str) -> usize {
+fn tokenize_text(state: &LlamaState, text: &str) -> Vec<LlamaToken> {
     if text.is_empty() {
-        return 0;
+        return Vec::new();
     }
 
     state
         .model
         .str_to_token(text, AddBos::Never)
         .unwrap_or_default()
-        .len()
 }
 
-fn split_text_to_fit(
-    text: &str,
-    state: &LlamaState,
-    limits: &BatchLimits,
-) -> Vec<TextChunk> {
+fn token_len_cached(state: &LlamaState, cache: &mut HashMap<String, usize>, text: &str) -> usize {
+    if text.is_empty() {
+        return 0;
+    }
+
+    if let Some(&len) = cache.get(text) {
+        return len;
+    }
+
+    let len = tokenize_text(state, text).len();
+    cache.insert(text.to_string(), len);
+    len
+}
+
+fn split_text_to_fit(text: &str, state: &LlamaState, limits: &BatchLimits) -> Vec<TextChunk> {
     if text.trim().is_empty() {
         return Vec::new();
     }
+
+    let mut token_len_cache: HashMap<String, usize> = HashMap::new();
 
     let max_text_tokens = limits
         .max_prompt_tokens
         .saturating_sub(state.cached_prefix_len)
         .saturating_sub(state.cached_prompt_suffix_len);
-    let full_len = text_token_len(state, text);
+    let full_len = token_len_cached(state, &mut token_len_cache, text);
     if full_len <= max_text_tokens {
+        let tokens = tokenize_text(state, text);
         return vec![TextChunk {
             text: text.to_string(),
+            tokens,
             tokens_len: full_len,
         }];
     }
@@ -613,12 +634,12 @@ fn split_text_to_fit(
             continue;
         }
 
-        let sentence_len = text_token_len(state, trimmed);
+        let sentence_len = token_len_cached(state, &mut token_len_cache, trimmed);
         let sentence_with_space_len = if current.is_empty() {
             sentence_len
         } else {
             let spaced = format!(" {}", trimmed);
-            text_token_len(state, &spaced)
+            token_len_cached(state, &mut token_len_cache, &spaced)
         };
         let candidate_len = current_len.saturating_add(sentence_with_space_len);
 
@@ -635,8 +656,11 @@ fn split_text_to_fit(
         }
 
         if !current.is_empty() {
+            let chunk_text = std::mem::take(&mut current);
+            let chunk_tokens = tokenize_text(state, &chunk_text);
             sentences.push(TextChunk {
-                text: std::mem::take(&mut current),
+                text: chunk_text,
+                tokens: chunk_tokens,
                 tokens_len: current_len,
             });
             current_len = 0;
@@ -654,9 +678,11 @@ fn split_text_to_fit(
                 if chunk.is_empty() {
                     break;
                 }
-                let chunk_len = text_token_len(state, chunk);
+                let chunk_len = token_len_cached(state, &mut token_len_cache, chunk);
+                let chunk_tokens = tokenize_text(state, chunk);
                 sentences.push(TextChunk {
                     text: chunk.to_string(),
+                    tokens: chunk_tokens,
                     tokens_len: chunk_len,
                 });
                 remaining = remaining[chunk.len()..].trim_start().to_string();
@@ -667,8 +693,10 @@ fn split_text_to_fit(
     }
 
     if !current.is_empty() {
+        let current_tokens = tokenize_text(state, &current);
         sentences.push(TextChunk {
             text: current,
+            tokens: current_tokens,
             tokens_len: current_len,
         });
     }
@@ -691,12 +719,13 @@ fn trim_to_fit(text: &str, state: &LlamaState, max_text_tokens: usize) -> Option
     let mut high = positions.len();
     let mut low = 1usize;
     let mut best = None;
+    let mut token_len_cache: HashMap<String, usize> = HashMap::new();
 
     while low < high {
         let mid = (low + high) / 2;
         let slice_len = positions[mid];
         let slice = candidate[..slice_len].trim_end();
-        if text_token_len(state, slice) <= max_text_tokens {
+        if token_len_cached(state, &mut token_len_cache, slice) <= max_text_tokens {
             best = Some(slice.to_string());
             low = mid + 1;
         } else {
