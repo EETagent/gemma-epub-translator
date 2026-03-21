@@ -3,7 +3,7 @@ use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::{BatchAddError, LlamaBatch};
 use llama_cpp_2::model::params::LlamaModelParams;
-use llama_cpp_2::model::{AddBos, LlamaModel, Special};
+use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::token::data::LlamaTokenData;
 use llama_cpp_2::token::data_array::LlamaTokenDataArray;
 use llama_cpp_2::token::LlamaToken;
@@ -356,8 +356,7 @@ fn run_batch_with_tokens(
                 clear_transient_sequences(state)?;
                 let mut outputs = Vec::with_capacity(output_tokens.len());
                 for tokens in &output_tokens {
-                    let text = state.model.tokens_to_str(tokens, Special::Plaintext)?;
-                    outputs.push(text.trim().to_string());
+                    outputs.push(tokens_to_plaintext(state.model.as_ref(), tokens));
                 }
                 return Ok(outputs);
             }
@@ -420,8 +419,7 @@ fn run_batch_with_tokens(
 
     let mut outputs = Vec::with_capacity(output_tokens.len());
     for tokens in &output_tokens {
-        let text = state.model.tokens_to_str(tokens, Special::Plaintext)?;
-        outputs.push(text.trim().to_string());
+        outputs.push(tokens_to_plaintext(state.model.as_ref(), tokens));
     }
 
     Ok(outputs)
@@ -751,6 +749,44 @@ fn is_single_word_input(text: &str) -> bool {
 fn filter_single_word_output(output: &str) -> String {
     let first_line = output.lines().next().unwrap_or(output).trim();
     first_line.to_string()
+}
+
+fn tokens_to_plaintext(model: &LlamaModel, tokens: &[LlamaToken]) -> String {
+    let mut bytes = Vec::with_capacity(tokens.len().saturating_mul(6));
+    for &token in tokens {
+        bytes.extend_from_slice(&token_bytes_resilient(model, token));
+    }
+
+    String::from_utf8_lossy(&bytes).trim().to_string()
+}
+
+fn token_bytes_resilient(model: &LlamaModel, token: LlamaToken) -> Vec<u8> {
+    const INITIAL_BUFFER: usize = 16;
+    const MAX_BUFFER: usize = 1 << 16;
+
+    let mut buffer_size = INITIAL_BUFFER;
+    for _ in 0..8 {
+        match model.token_to_piece_bytes(token, buffer_size, false, None) {
+            Ok(bytes) => return bytes,
+            Err(TokenToStringError::InsufficientBufferSpace(required)) => {
+                let required_abs = if required == i32::MIN {
+                    buffer_size.saturating_mul(2)
+                } else {
+                    required.unsigned_abs() as usize
+                };
+                let next = required_abs.max(buffer_size.saturating_mul(2));
+                if next <= buffer_size || next > MAX_BUFFER {
+                    break;
+                }
+                buffer_size = next;
+            }
+            Err(TokenToStringError::UnknownTokenType) => return Vec::new(),
+            Err(TokenToStringError::FromUtf8Error(_)) => return Vec::new(),
+            Err(_) => return Vec::new(),
+        }
+    }
+
+    Vec::new()
 }
 
 fn locale_to_lang(locale: &str) -> Result<(String, String), TranslateError> {
