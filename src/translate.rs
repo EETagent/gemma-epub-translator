@@ -150,7 +150,7 @@ pub fn translate_texts_with_cancel(
     let mut chunk_results: Vec<Vec<Option<String>>> = vec![Vec::new(); texts.len()];
     let prompt_prefix = build_prompt_prefix(source_locale, target_locale)?;
 
-    ensure_suffix_cached(&mut state);
+    ensure_suffix_cached(&mut state)?;
     ensure_prefix_cached(&mut state, &prompt_prefix)?;
 
     for (index, text) in texts.iter().enumerate() {
@@ -159,7 +159,7 @@ pub fn translate_texts_with_cancel(
             continue;
         }
 
-        let chunks = split_text_to_fit(text, &state, &limits);
+        let chunks = split_text_to_fit(text, &state, &limits)?;
         if chunks.is_empty() {
             outputs[index] = text.to_string();
             continue;
@@ -432,9 +432,7 @@ fn init_state() -> Result<LlamaState, TranslateError> {
     let model_ref: &'static LlamaModel = unsafe { &*(&*model as *const LlamaModel) };
 
     let ctx = model_ref.new_context(&backend, ctx_params)?;
-    let stop_tokens = model_ref
-        .str_to_token(STOP_SEQUENCE, AddBos::Never)
-        .unwrap_or_default();
+    let stop_tokens = model_ref.str_to_token(STOP_SEQUENCE, AddBos::Never)?;
 
     Ok(LlamaState {
         backend,
@@ -449,14 +447,16 @@ fn init_state() -> Result<LlamaState, TranslateError> {
     })
 }
 
-fn ensure_suffix_cached(state: &mut LlamaState) {
+fn ensure_suffix_cached(state: &mut LlamaState) -> TranslateResult<()> {
     if !state.cached_prompt_suffix_tokens.is_empty() {
-        return;
+        return Ok(());
     }
 
-    let suffix_tokens = tokenize_text(state, PROMPT_SUFFIX).unwrap_or_default();
+    let suffix_tokens = tokenize_text(state, PROMPT_SUFFIX)?;
     state.cached_prompt_suffix_len = suffix_tokens.len();
     state.cached_prompt_suffix_tokens = suffix_tokens;
+
+    Ok(())
 }
 
 fn ensure_prefix_cached(state: &mut LlamaState, prompt_prefix: &str) -> TranslateResult<usize> {
@@ -558,23 +558,31 @@ fn tokenize_text(state: &LlamaState, text: &str) -> TranslateResult<Vec<LlamaTok
     Ok(tokens)
 }
 
-fn token_len_cached(state: &LlamaState, cache: &mut HashMap<String, usize>, text: &str) -> usize {
+fn token_len_cached(
+    state: &LlamaState,
+    cache: &mut HashMap<String, usize>,
+    text: &str,
+) -> TranslateResult<usize> {
     if text.is_empty() {
-        return 0;
+        return Ok(0);
     }
 
     if let Some(&len) = cache.get(text) {
-        return len;
+        return Ok(len);
     }
 
-    let len = tokenize_text(state, text).map(|v| v.len()).unwrap_or(0);
+    let len = tokenize_text(state, text)?.len();
     cache.insert(text.to_string(), len);
-    len
+    Ok(len)
 }
 
-fn split_text_to_fit(text: &str, state: &LlamaState, limits: &BatchLimits) -> Vec<TextChunk> {
+fn split_text_to_fit(
+    text: &str,
+    state: &LlamaState,
+    limits: &BatchLimits,
+) -> TranslateResult<Vec<TextChunk>> {
     if text.trim().is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let mut token_len_cache: HashMap<String, usize> = HashMap::new();
@@ -583,14 +591,14 @@ fn split_text_to_fit(text: &str, state: &LlamaState, limits: &BatchLimits) -> Ve
         .max_prompt_tokens
         .saturating_sub(state.cached_prefix_len)
         .saturating_sub(state.cached_prompt_suffix_len);
-    let full_len = token_len_cached(state, &mut token_len_cache, text);
+    let full_len = token_len_cached(state, &mut token_len_cache, text)?;
     if full_len <= max_text_tokens {
-        let tokens = tokenize_text(state, text);
-        return vec![TextChunk {
+        let tokens = tokenize_text(state, text)?;
+        return Ok(vec![TextChunk {
             text: text.to_string(),
-            tokens: tokens.unwrap_or_default(),
+            tokens,
             tokens_len: full_len,
-        }];
+        }]);
     }
 
     let mut sentences = Vec::new();
@@ -603,12 +611,12 @@ fn split_text_to_fit(text: &str, state: &LlamaState, limits: &BatchLimits) -> Ve
             continue;
         }
 
-        let sentence_len = token_len_cached(state, &mut token_len_cache, trimmed);
+        let sentence_len = token_len_cached(state, &mut token_len_cache, trimmed)?;
         let sentence_with_space_len = if current.is_empty() {
             sentence_len
         } else {
             let spaced = format!(" {}", trimmed);
-            token_len_cached(state, &mut token_len_cache, &spaced)
+            token_len_cached(state, &mut token_len_cache, &spaced)?
         };
         let candidate_len = current_len.saturating_add(sentence_with_space_len);
 
@@ -626,7 +634,7 @@ fn split_text_to_fit(text: &str, state: &LlamaState, limits: &BatchLimits) -> Ve
 
         if !current.is_empty() {
             let chunk_text = std::mem::take(&mut current);
-            let chunk_tokens = tokenize_text(state, &chunk_text).unwrap_or_default();
+            let chunk_tokens = tokenize_text(state, &chunk_text)?;
             sentences.push(TextChunk {
                 text: chunk_text,
                 tokens: chunk_tokens,
@@ -642,22 +650,22 @@ fn split_text_to_fit(text: &str, state: &LlamaState, limits: &BatchLimits) -> Ve
             let mut remaining = trimmed.to_string();
             while !remaining.is_empty() {
                 if max_text_tokens == 0 {
-                    return Vec::new();
+                    return Ok(Vec::new());
                 }
-                let chunk = trim_to_fit(&remaining, state, max_text_tokens)
+                let chunk = trim_to_fit(&remaining, state, max_text_tokens)?
                     .unwrap_or_else(|| remaining.clone());
                 let chunk = chunk.trim();
                 if chunk.is_empty() {
                     break;
                 }
-                let chunk_len = token_len_cached(state, &mut token_len_cache, chunk);
+                let chunk_len = token_len_cached(state, &mut token_len_cache, chunk)?;
                 if chunk_len > max_text_tokens {
-                    return Vec::new();
+                    return Ok(Vec::new());
                 }
-                let chunk_tokens = tokenize_text(state, chunk);
+                let chunk_tokens = tokenize_text(state, chunk)?;
                 sentences.push(TextChunk {
                     text: chunk.to_string(),
-                    tokens: chunk_tokens.unwrap_or_default(),
+                    tokens: chunk_tokens,
                     tokens_len: chunk_len,
                 });
                 remaining = remaining[chunk.len()..].trim_start().to_string();
@@ -667,25 +675,29 @@ fn split_text_to_fit(text: &str, state: &LlamaState, limits: &BatchLimits) -> Ve
     }
 
     if !current.is_empty() {
-        let current_tokens = tokenize_text(state, &current);
+        let current_tokens = tokenize_text(state, &current)?;
         sentences.push(TextChunk {
             text: current,
-            tokens: current_tokens.unwrap_or_default(),
+            tokens: current_tokens,
             tokens_len: current_len,
         });
     }
 
     if sentences.is_empty() {
-        Vec::new()
+        Ok(Vec::new())
     } else {
-        sentences
+        Ok(sentences)
     }
 }
 
-fn trim_to_fit(text: &str, state: &LlamaState, max_text_tokens: usize) -> Option<String> {
+fn trim_to_fit(
+    text: &str,
+    state: &LlamaState,
+    max_text_tokens: usize,
+) -> TranslateResult<Option<String>> {
     let candidate = text.trim().to_string();
     if candidate.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     let mut positions: Vec<usize> = candidate.char_indices().map(|(idx, _)| idx).collect();
@@ -699,7 +711,7 @@ fn trim_to_fit(text: &str, state: &LlamaState, max_text_tokens: usize) -> Option
         let mid = (low + high) / 2;
         let slice_len = positions[mid];
         let slice = candidate[..slice_len].trim_end();
-        if token_len_cached(state, &mut token_len_cache, slice) <= max_text_tokens {
+        if token_len_cached(state, &mut token_len_cache, slice)? <= max_text_tokens {
             best = Some(slice.to_string());
             low = mid + 1;
         } else {
@@ -707,7 +719,7 @@ fn trim_to_fit(text: &str, state: &LlamaState, max_text_tokens: usize) -> Option
         }
     }
 
-    best
+    Ok(best)
 }
 
 fn is_short_input_text_with_len(tokens_len: usize) -> bool {
