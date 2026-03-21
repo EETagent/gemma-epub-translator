@@ -274,10 +274,9 @@ impl ViewDelegate for ContentView {
 impl SrtView {
     pub fn new() -> Self {
         let ui = Rc::new(RefCell::new(SharedUi::new()));
-        Self {
-            view: View::with(ContentView { ui: ui.clone() }),
-            ui,
-        }
+        let view = View::with(ContentView { ui: ui.clone() });
+        view.set_translates_autoresizing_mask_into_constraints(true);
+        Self { view, ui }
     }
 
     pub fn set_model_state(&self, state: Arc<Mutex<LlamaState>>) {
