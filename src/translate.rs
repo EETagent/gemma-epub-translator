@@ -3,7 +3,6 @@ use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaModel, Special};
-use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::token::data::LlamaTokenData;
 use llama_cpp_2::token::data_array::LlamaTokenDataArray;
 use llama_cpp_2::token::LlamaToken;
@@ -23,9 +22,6 @@ const SHORT_OUTPUT_TOKENS: usize = 16;
 const SHORT_INPUT_TOKENS: usize = 4;
 const MAX_SEQ_BATCH: usize = 8 * 2;
 const STOP_SEQUENCE: &str = "<end_of_turn>";
-const TOP_K: i32 = 64;
-const TOP_P: f32 = 0.95;
-const TOP_P_MIN_KEEP: usize = 1;
 
 const PROMPT_PREFIX_TEMPLATE: &str = "<bos><start_of_turn>user\nYou are a professional {SOURCE_LANG} ({SOURCE_CODE}) to {TARGET_LANG} ({TARGET_CODE}) translator. Your goal is to accurately convey the meaning and nuances of the original {SOURCE_LANG} text while adhering to {TARGET_LANG} grammar, vocabulary, and cultural sensitivities.\nProduce only the {TARGET_LANG} translation, without any additional explanations or commentary. Please translate the following {SOURCE_LANG} text into {TARGET_LANG}:\n\n\n";
 const PROMPT_SUFFIX: &str = "<end_of_turn>\n<start_of_turn>model\n";
@@ -332,10 +328,6 @@ fn run_batch_with_tokens(
         .map(|tokens| (prefix_len + tokens.len()) as i32)
         .collect();
     let mut active = vec![true; seq_count];
-    let mut samplers: Vec<LlamaSampler> = (0..seq_count)
-        .map(|seq_index| build_sampler(0x1234_u32.wrapping_add(seq_index as u32)))
-        .collect();
-
     for _ in 0..max_output_tokens {
         if let Some(flag) = cancel_flag {
             if !flag.load(Ordering::SeqCst) {
@@ -370,12 +362,7 @@ fn run_batch_with_tokens(
                     .map(|(i, logit)| LlamaTokenData::new(LlamaToken::new(i), *logit, 0.0)),
                 false,
             );
-
-            data_array.apply_sampler(&samplers[seq_index]);
-            let token = data_array
-                .selected_token()
-                .unwrap_or_else(|| data_array.sample_token_greedy());
-            samplers[seq_index].accept(token);
+            let token = data_array.sample_token_greedy();
             if state.model.is_eog_token(token) {
                 active[seq_index] = false;
                 continue;
@@ -929,14 +916,6 @@ fn locale_to_lang(locale: &str) -> (String, String) {
     };
 
     (language.to_string(), normalized)
-}
-
-fn build_sampler(seed: u32) -> LlamaSampler {
-    LlamaSampler::chain_simple([
-        LlamaSampler::top_k(TOP_K),
-        LlamaSampler::top_p(TOP_P, TOP_P_MIN_KEEP),
-        LlamaSampler::dist(seed),
-    ])
 }
 
 fn tokens_end_with(tokens: &[LlamaToken], suffix: &[LlamaToken]) -> bool {
