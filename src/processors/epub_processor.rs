@@ -3,42 +3,28 @@ use crate::translate::{translate_texts_with_cancel, LlamaState, TranslateError};
 use epub::doc::{DocError, EpubDoc};
 use lol_html::html_content::{ContentType, TextType};
 use lol_html::{element, text, HtmlRewriter, Settings};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use thiserror::Error;
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum ProcessError {
-    Doc(DocError),
-    Rebuild(RebuildError),
-    Translate(TranslateError),
+    #[error(transparent)]
+    Doc(#[from] DocError),
+    #[error(transparent)]
+    Rebuild(#[from] RebuildError),
+    #[error(transparent)]
+    Translate(#[from] TranslateError),
+    #[error("translation mapping mismatch while rebuilding EPUB")]
+    TranslationMappingMismatch,
+    #[error("translation cancelled")]
     Cancelled,
-}
-
-impl From<DocError> for ProcessError {
-    fn from(err: DocError) -> Self {
-        Self::Doc(err)
-    }
-}
-
-impl From<RebuildError> for ProcessError {
-    fn from(err: RebuildError) -> Self {
-        Self::Rebuild(err)
-    }
-}
-
-impl From<TranslateError> for ProcessError {
-    fn from(err: TranslateError) -> Self {
-        Self::Translate(err)
-    }
 }
 
 #[derive(Debug, Clone)]
 pub struct TextSegment {
-    pub id: usize,
     pub text: String,
-    pub file_name: String,
 }
 
 pub struct ExtractionResult {
@@ -49,7 +35,6 @@ pub struct ExtractionResult {
 pub fn extract_text_segments<P: AsRef<Path>>(path: P) -> Result<ExtractionResult, ProcessError> {
     let mut doc = EpubDoc::new(path)?;
     let mut segments = Vec::new();
-    let mut segment_id = 0;
     let mut total_words = 0;
 
     for spine_item in doc.spine.clone() {
@@ -60,7 +45,6 @@ pub fn extract_text_segments<P: AsRef<Path>>(path: P) -> Result<ExtractionResult
             continue;
         }
 
-        let file_name = spine_item.idref.clone();
         let texts = extract_text_from_html(&html);
 
         for text in texts {
@@ -73,11 +57,8 @@ pub fn extract_text_segments<P: AsRef<Path>>(path: P) -> Result<ExtractionResult
             total_words += words;
 
             segments.push(TextSegment {
-                id: segment_id,
                 text: text.to_string(),
-                file_name: file_name.clone(),
             });
-            segment_id += 1;
         }
     }
 
@@ -110,7 +91,7 @@ where
         return Ok(output_path);
     }
 
-    let mut translation_map: HashMap<String, String> = HashMap::new();
+    let mut translated_segments = vec![String::new(); total];
 
     let batch_size = 32;
     let mut start = 0usize;
@@ -146,14 +127,7 @@ where
                 .cloned()
                 .unwrap_or_else(|| segment.text.clone());
             let index = start + offset;
-            println!(
-                "Translated {}/{}: {} -> {}",
-                index + 1,
-                total,
-                segment.text,
-                translated
-            );
-            translation_map.insert(segment.text.clone(), translated);
+            translated_segments[index] = translated;
             on_progress(index + 1, total);
         }
 
@@ -166,18 +140,60 @@ where
         }
     }
 
-    let translation_map = Arc::new(translation_map);
+    let source_segments: Vec<String> = extraction
+        .segments
+        .iter()
+        .map(|segment| segment.text.clone())
+        .collect();
+
+    let source_segments = Arc::new(source_segments);
+    let translated_segments = Arc::new(translated_segments);
+    let cursor = Arc::new(Mutex::new(0usize));
+    let mapping_mismatch = Arc::new(AtomicBool::new(false));
 
     rebuild_epub_with(input_path, &output_path, |name, bytes| {
         if is_html_name(name) {
+            let mut cursor = cursor.lock().ok()?;
+            let html = String::from_utf8_lossy(bytes);
+            let extracted = extract_text_from_html(&html);
+            let start = *cursor;
+            let end = start.saturating_add(extracted.len());
+            let expected = match source_segments.get(start..end) {
+                Some(value) => value,
+                None => {
+                    mapping_mismatch.store(true, Ordering::SeqCst);
+                    return None;
+                }
+            };
+            if expected != extracted {
+                mapping_mismatch.store(true, Ordering::SeqCst);
+                return None;
+            }
+
+            let replacements = match translated_segments.get(start..end) {
+                Some(value) => value.iter().cloned().collect::<Vec<String>>(),
+                None => {
+                    mapping_mismatch.store(true, Ordering::SeqCst);
+                    return None;
+                }
+            };
+            *cursor = end;
+
             Some(rewrite_html_with_translations(
                 bytes,
-                translation_map.clone(),
+                Arc::new(replacements),
             ))
         } else {
             None
         }
     })?;
+
+    let consumed = *cursor
+        .lock()
+        .map_err(|_| ProcessError::TranslationMappingMismatch)?;
+    if consumed != total || mapping_mismatch.load(Ordering::SeqCst) {
+        return Err(ProcessError::TranslationMappingMismatch);
+    }
 
     Ok(output_path)
 }
@@ -247,7 +263,7 @@ fn normalized_segment(content: &str) -> Option<String> {
     }
 }
 
-fn translated_segment(content: &str, translations: &HashMap<String, String>) -> Option<String> {
+fn translated_segment(content: &str, translated: &str) -> Option<String> {
     let normalized = content.replace("&nbsp;", " ");
     let trimmed = normalized.trim();
     if trimmed.is_empty() {
@@ -267,10 +283,6 @@ fn translated_segment(content: &str, translations: &HashMap<String, String>) -> 
         .rev()
         .collect();
 
-    let translated = translations
-        .get(trimmed)
-        .cloned()
-        .unwrap_or_else(|| trimmed.to_string());
     Some(format!("{}{}{}", leading_ws, translated, trailing_ws))
 }
 
@@ -371,10 +383,7 @@ fn extract_text_from_html(html: &str) -> Vec<String> {
     texts.take()
 }
 
-fn rewrite_html_with_translations(
-    bytes: &[u8],
-    translations: Arc<HashMap<String, String>>,
-) -> Vec<u8> {
+fn rewrite_html_with_translations(bytes: &[u8], translations: Arc<Vec<String>>) -> Vec<u8> {
     let mut output = Vec::with_capacity(bytes.len());
 
     let stack = std::rc::Rc::new(std::cell::RefCell::new(Vec::<CaptureFrame>::new()));
@@ -385,6 +394,9 @@ fn rewrite_html_with_translations(
     let stack_for_spans_end = stack.clone();
     let translations_for_spans_end = translations.clone();
     let stack_for_text = stack.clone();
+    let translation_index = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let translation_index_for_blocks = translation_index.clone();
+    let translation_index_for_spans = translation_index.clone();
 
     let mut rewriter = HtmlRewriter::new(
         Settings {
@@ -394,15 +406,21 @@ fn rewrite_html_with_translations(
                     if let Some(handlers) = el.end_tag_handlers() {
                         let stack_for_end = stack_for_blocks_end.clone();
                         let translations_for_end = translations_for_blocks_end.clone();
+                        let translation_index_for_end = translation_index_for_blocks.clone();
                         handlers.push(Box::new(move |end| {
                             if let Some((frame, has_block_ancestor)) =
                                 pop_capture_frame(&stack_for_end)
                             {
                                 if should_emit_frame(&frame, has_block_ancestor) {
-                                    if let Some(result) = translated_segment(
-                                        &frame.text,
-                                        translations_for_end.as_ref(),
-                                    ) {
+                                    let idx = translation_index_for_end.get();
+                                    let translated_text = translations_for_end
+                                        .get(idx)
+                                        .cloned()
+                                        .unwrap_or_else(|| frame.text.trim().to_string());
+                                    translation_index_for_end.set(idx.saturating_add(1));
+                                    if let Some(result) =
+                                        translated_segment(&frame.text, translated_text.as_str())
+                                    {
                                         end.before(&result, ContentType::Text);
                                     }
                                 }
@@ -431,15 +449,22 @@ fn rewrite_html_with_translations(
                     if let Some(handlers) = el.end_tag_handlers() {
                         let stack_for_end = stack_for_spans_end.clone();
                         let translations_for_end = translations_for_spans_end.clone();
+                        let translation_index_for_end = translation_index_for_spans.clone();
                         handlers.push(Box::new(move |end| {
                             if should_capture {
                                 if let Some((frame, has_block_ancestor)) =
                                     pop_capture_frame(&stack_for_end)
                                 {
                                     if should_emit_frame(&frame, has_block_ancestor) {
+                                        let idx = translation_index_for_end.get();
+                                        let translated_text = translations_for_end
+                                            .get(idx)
+                                            .cloned()
+                                            .unwrap_or_else(|| frame.text.trim().to_string());
+                                        translation_index_for_end.set(idx.saturating_add(1));
                                         if let Some(result) = translated_segment(
                                             &frame.text,
-                                            translations_for_end.as_ref(),
+                                            translated_text.as_str(),
                                         ) {
                                             end.before(&result, ContentType::Text);
                                         }

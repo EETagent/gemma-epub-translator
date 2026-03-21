@@ -3,19 +3,22 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use thiserror::Error;
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum SrtProcessError {
-    Io(std::io::Error),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error("invalid SRT format: {0}")]
     InvalidFormat(String),
-    Translate(String),
+    #[error(transparent)]
+    Translate(#[from] crate::translate::TranslateError),
+    #[error("translation output could not be parsed")]
+    InvalidModelOutput,
+    #[error("subtitle index/timing row is malformed")]
+    MalformedCue,
+    #[error("translation cancelled")]
     Cancelled,
-}
-
-impl From<std::io::Error> for SrtProcessError {
-    fn from(err: std::io::Error) -> Self {
-        Self::Io(err)
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -26,9 +29,8 @@ struct SrtCue {
 }
 
 #[derive(Clone, Debug)]
-struct CueTextUnit {
+struct CueContext {
     cue_index: usize,
-    line_index: usize,
     text: String,
     is_short: bool,
 }
@@ -49,17 +51,17 @@ where
     let content = fs::read_to_string(input_path)?;
     let mut cues = parse_srt(&content)?;
 
-    let units = build_text_units(&cues);
-    let total = units.len();
+    let contexts = build_cue_contexts(&cues);
+    let total = contexts.len();
     if total == 0 {
         let output = output_path_with_locale(input_path, target_locale);
         fs::write(&output, content)?;
         return Ok(output);
     }
 
-    let mut translated_lines: Vec<Option<String>> = vec![None; total];
+    let mut translated_cues: Vec<Option<Vec<String>>> = vec![None; total];
     let mut done = 0usize;
-    let batch_size = 32;
+    let batch_size = 24;
     let mut start = 0usize;
 
     while start < total {
@@ -68,10 +70,10 @@ where
         }
 
         let end = usize::min(start + batch_size, total);
-        let batch = &units[start..end];
+        let batch = &contexts[start..end];
         let prompt_texts: Vec<String> = batch
             .iter()
-            .map(|unit| build_contextual_prompt(unit, &units))
+            .map(|ctx| build_contextual_prompt(ctx, &contexts))
             .collect();
 
         let translated_batch = translate_texts_with_cancel(
@@ -80,20 +82,29 @@ where
             source_locale,
             target_locale,
             cancel_flag.as_ref(),
-        )
-        .map_err(|err| SrtProcessError::Translate(err.to_string()))?;
+        )?;
 
         if is_cancelled(cancel_flag.as_ref()) {
             return Err(SrtProcessError::Cancelled);
         }
 
-        for (offset, unit) in batch.iter().enumerate() {
+        for (offset, cue_ctx) in batch.iter().enumerate() {
             let raw = translated_batch
                 .get(offset)
                 .cloned()
-                .unwrap_or_else(|| unit.text.clone());
-            let normalized = extract_current_translation(&raw, &unit.text);
-            translated_lines[start + offset] = Some(normalized);
+                .unwrap_or_else(|| cue_ctx.text.clone());
+
+            let parsed = extract_current_translation(&raw).and_then(|value| {
+                split_translated_lines(&value, cue_line_count(&cues[cue_ctx.cue_index]))
+            });
+
+            let translated_lines = match parsed {
+                Some(lines) => lines,
+                None => {
+                    return Err(SrtProcessError::InvalidModelOutput);
+                }
+            };
+            translated_cues[start + offset] = Some(translated_lines);
             done += 1;
             on_progress(done, total);
         }
@@ -101,7 +112,7 @@ where
         start = end;
     }
 
-    apply_translations(&mut cues, &units, &translated_lines);
+    apply_translations(&mut cues, &contexts, &translated_cues);
     let output_content = serialize_srt(&cues);
     let output = output_path_with_locale(input_path, target_locale);
     fs::write(&output, output_content)?;
@@ -110,14 +121,15 @@ where
 
 fn parse_srt(content: &str) -> Result<Vec<SrtCue>, SrtProcessError> {
     let normalized = content.replace("\r\n", "\n");
-    let blocks: Vec<&str> = normalized.split("\n\n").collect();
+    let blocks = split_srt_blocks(&normalized);
     let mut cues = Vec::new();
 
-    for block in blocks {
+    for block in &blocks {
         let mut lines = block
             .lines()
             .map(str::trim_end)
-            .filter(|line| !line.is_empty());
+            .collect::<Vec<_>>()
+            .into_iter();
 
         let Some(index) = lines.next() else {
             continue;
@@ -127,7 +139,15 @@ fn parse_srt(content: &str) -> Result<Vec<SrtCue>, SrtProcessError> {
                 "Missing timing row in SRT block".to_string(),
             ));
         };
-        let text_lines: Vec<String> = lines.map(|line| line.to_string()).collect();
+
+        if index.trim().is_empty() || !timing.contains("-->") {
+            return Err(SrtProcessError::MalformedCue);
+        }
+
+        let text_lines: Vec<String> = lines
+            .map(str::to_string)
+            .filter(|line| !line.trim().is_empty())
+            .collect();
 
         cues.push(SrtCue {
             index: index.to_string(),
@@ -161,30 +181,35 @@ fn serialize_srt(cues: &[SrtCue]) -> String {
     out
 }
 
-fn build_text_units(cues: &[SrtCue]) -> Vec<CueTextUnit> {
-    let mut units = Vec::new();
-    for (cue_index, cue) in cues.iter().enumerate() {
-        for (line_index, line) in cue.text_lines.iter().enumerate() {
-            let text = line.trim();
+fn build_cue_contexts(cues: &[SrtCue]) -> Vec<CueContext> {
+    cues.iter()
+        .enumerate()
+        .filter_map(|(cue_index, cue)| {
+            let text = cue
+                .text_lines
+                .iter()
+                .map(|line| line.trim())
+                .filter(|line| !line.is_empty())
+                .collect::<Vec<&str>>()
+                .join("\n");
             if text.is_empty() {
-                continue;
+                return None;
             }
+
             let words = text.split_whitespace().count();
-            units.push(CueTextUnit {
+            Some(CueContext {
                 cue_index,
-                line_index,
-                text: text.to_string(),
-                is_short: words <= 3,
-            });
-        }
-    }
-    units
+                text,
+                is_short: words <= 4,
+            })
+        })
+        .collect()
 }
 
-fn build_contextual_prompt(unit: &CueTextUnit, units: &[CueTextUnit]) -> String {
+fn build_contextual_prompt(unit: &CueContext, units: &[CueContext]) -> String {
     let unit_pos = units
         .iter()
-        .position(|u| u.cue_index == unit.cue_index && u.line_index == unit.line_index)
+        .position(|u| u.cue_index == unit.cue_index)
         .unwrap_or(0);
 
     let prev = if unit_pos > 0 {
@@ -200,45 +225,41 @@ fn build_contextual_prompt(unit: &CueTextUnit, units: &[CueTextUnit]) -> String 
 
     if unit.is_short {
         format!(
-            "Context previous line: {prev}\nCurrent line: {}\nContext next line: {next}\nTranslate only the Current line.",
+            "You are translating subtitle cues. Keep meaning and subtitle style. Preserve line breaks when possible.\n<context_prev>\n{prev}\n</context_prev>\n<context_next>\n{next}\n</context_next>\n<current>\n{}\n</current>\nReturn ONLY the translated current cue wrapped as:\n<translated>...your translation...</translated>",
             unit.text
         )
     } else {
-        unit.text.clone()
+        format!(
+            "Translate this subtitle cue. Preserve subtitle style and line breaks.\n<current>\n{}\n</current>\nReturn ONLY:\n<translated>...your translation...</translated>",
+            unit.text
+        )
     }
 }
 
-fn extract_current_translation(raw: &str, fallback: &str) -> String {
+fn extract_current_translation(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return fallback.to_string();
+        return None;
     }
 
-    if let Some(line) = trimmed
-        .lines()
-        .find(|line| line.to_ascii_lowercase().starts_with("current line:"))
-    {
-        let translated = line
-            .split_once(':')
-            .map(|(_, value)| value.trim())
-            .unwrap_or_default();
-        if !translated.is_empty() {
-            return translated.to_string();
+    let lower = trimmed.to_ascii_lowercase();
+    if let (Some(start), Some(end)) = (lower.find("<translated>"), lower.find("</translated>")) {
+        if end > start {
+            let value_start = start + "<translated>".len();
+            let value = trimmed[value_start..end].trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
         }
     }
 
-    trimmed
-        .lines()
-        .next()
-        .unwrap_or(fallback)
-        .trim()
-        .to_string()
+    None
 }
 
 fn apply_translations(
     cues: &mut [SrtCue],
-    units: &[CueTextUnit],
-    translated_lines: &[Option<String>],
+    units: &[CueContext],
+    translated_lines: &[Option<Vec<String>>],
 ) {
     for (idx, unit) in units.iter().enumerate() {
         let Some(translated) = translated_lines.get(idx).and_then(|v| v.as_ref()) else {
@@ -246,11 +267,59 @@ fn apply_translations(
         };
 
         if let Some(cue) = cues.get_mut(unit.cue_index) {
-            if let Some(line) = cue.text_lines.get_mut(unit.line_index) {
-                *line = translated.clone();
-            }
+            cue.text_lines = translated.clone();
         }
     }
+}
+
+fn cue_line_count(cue: &SrtCue) -> usize {
+    cue.text_lines
+        .iter()
+        .filter(|line| !line.trim().is_empty())
+        .count()
+        .max(1)
+}
+
+fn split_translated_lines(text: &str, max_lines: usize) -> Option<Vec<String>> {
+    let lines = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<String>>();
+
+    if lines.is_empty() {
+        return None;
+    }
+
+    if lines.len() <= max_lines {
+        return Some(lines);
+    }
+
+    let merged = lines.join(" ");
+    Some(vec![merged])
+}
+
+fn split_srt_blocks(normalized: &str) -> Vec<String> {
+    let mut blocks = Vec::new();
+    let mut current = Vec::new();
+
+    for line in normalized.lines() {
+        if line.trim().is_empty() {
+            if !current.is_empty() {
+                blocks.push(current.join("\n"));
+                current.clear();
+            }
+            continue;
+        }
+        current.push(line.to_string());
+    }
+
+    if !current.is_empty() {
+        blocks.push(current.join("\n"));
+    }
+
+    blocks
 }
 
 fn is_cancelled(flag: Option<&Arc<AtomicBool>>) -> bool {

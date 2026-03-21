@@ -104,8 +104,6 @@ pub fn translate_texts_with_state(
 
 pub struct BatchLimits {
     pub max_prompt_tokens: usize,
-    pub max_batch_tokens: usize,
-    pub max_sequences: usize,
 }
 
 struct TextChunk {
@@ -145,8 +143,6 @@ pub fn translate_texts_with_cancel(
     let per_seq_capacity = (CTX_SIZE as usize) / state.max_seq_batch.max(1);
     let limits = BatchLimits {
         max_prompt_tokens: per_seq_capacity.saturating_sub(MAX_OUTPUT_TOKENS),
-        max_batch_tokens: state.ctx.n_batch() as usize,
-        max_sequences: state.max_seq_batch.saturating_sub(1),
     };
     let mut outputs = vec![String::new(); texts.len()];
     let mut prompts: Vec<PreparedPrompt> = Vec::new();
@@ -244,7 +240,7 @@ fn run_batch_inference(
         }
 
         let mut batch_indices = Vec::new();
-        let mut batch_tokens = Vec::new();
+        let mut batch_tokens: Vec<&[LlamaToken]> = Vec::new();
         let mut batch_max_output = MAX_OUTPUT_TOKENS;
         let mut token_count = 0usize;
 
@@ -280,7 +276,7 @@ fn run_batch_inference(
 
             token_count += token_len;
             batch_indices.push(prompt.key);
-            batch_tokens.push(prompt.prompt_tokens.clone());
+            batch_tokens.push(prompt.prompt_tokens.as_slice());
             index += 1;
         }
 
@@ -311,7 +307,7 @@ fn run_batch_inference(
 fn run_batch_with_tokens(
     state: &mut LlamaState,
     prefix_len: usize,
-    prompt_tokens: &[Vec<LlamaToken>],
+    prompt_tokens: &[&[LlamaToken]],
     max_output_tokens: usize,
     cancel_flag: Option<&Arc<AtomicBool>>,
 ) -> TranslateResult<Vec<String>> {

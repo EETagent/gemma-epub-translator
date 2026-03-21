@@ -1,37 +1,21 @@
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use thiserror::Error;
 use zip::write::FileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum RebuildError {
-    Io(std::io::Error),
-    Zip(zip::result::ZipError),
-    Utf8(std::str::Utf8Error),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Zip(#[from] zip::result::ZipError),
 }
 
-impl From<std::io::Error> for RebuildError {
-    fn from(err: std::io::Error) -> Self {
-        Self::Io(err)
-    }
-}
-
-impl From<zip::result::ZipError> for RebuildError {
-    fn from(err: zip::result::ZipError) -> Self {
-        Self::Zip(err)
-    }
-}
-
-impl From<std::str::Utf8Error> for RebuildError {
-    fn from(err: std::str::Utf8Error) -> Self {
-        Self::Utf8(err)
-    }
-}
-
-pub fn rebuild_epub_with<P: AsRef<Path>>(
-    input_path: P,
-    output_path: P,
+pub fn rebuild_epub_with<I: AsRef<Path>, O: AsRef<Path>>(
+    input_path: I,
+    output_path: O,
     mut replace_html: impl FnMut(&str, &[u8]) -> Option<Vec<u8>>,
 ) -> Result<(), RebuildError> {
     let input_path = input_path.as_ref();
