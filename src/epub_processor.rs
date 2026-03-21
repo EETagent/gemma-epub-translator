@@ -175,38 +175,179 @@ where
     Ok(output_path)
 }
 
+const BLOCK_TEXT_CONTAINERS: &str = "p,li,h1,h2,h3,h4,h5,h6,div";
+const INLINE_TEXT_CONTAINERS: &str = "span";
+const TRANSLATABLE_TEXT_CONTAINERS: &str = "p,li,h1,h2,h3,h4,h5,h6,div,span";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CaptureKind {
+    Block,
+    Span,
+}
+
+#[derive(Debug)]
+struct CaptureFrame {
+    kind: CaptureKind,
+    text: String,
+    has_block_descendant: bool,
+}
+
+fn push_capture_frame(
+    stack: &std::rc::Rc<std::cell::RefCell<Vec<CaptureFrame>>>,
+    kind: CaptureKind,
+) {
+    let mut frames = stack.borrow_mut();
+    if kind == CaptureKind::Block {
+        if let Some(parent) = frames.last_mut() {
+            if parent.kind == CaptureKind::Block {
+                parent.has_block_descendant = true;
+            }
+        }
+    }
+
+    frames.push(CaptureFrame {
+        kind,
+        text: String::new(),
+        has_block_descendant: false,
+    });
+}
+
+fn pop_capture_frame(
+    stack: &std::rc::Rc<std::cell::RefCell<Vec<CaptureFrame>>>,
+) -> Option<(CaptureFrame, bool)> {
+    let frame = stack.borrow_mut().pop()?;
+    let has_block_ancestor = stack
+        .borrow()
+        .iter()
+        .any(|ancestor| ancestor.kind == CaptureKind::Block);
+    Some((frame, has_block_ancestor))
+}
+
+fn should_emit_frame(frame: &CaptureFrame, has_block_ancestor: bool) -> bool {
+    match frame.kind {
+        CaptureKind::Block => !frame.has_block_descendant,
+        CaptureKind::Span => !has_block_ancestor,
+    }
+}
+
+fn normalized_segment(content: &str) -> Option<String> {
+    let normalized = content.replace("&nbsp;", " ");
+    let trimmed = normalized.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn translated_segment(content: &str, translations: &HashMap<String, String>) -> Option<String> {
+    let normalized = content.replace("&nbsp;", " ");
+    let trimmed = normalized.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let leading_ws: String = normalized
+        .chars()
+        .take_while(|c| c.is_whitespace())
+        .collect();
+    let trailing_ws: String = normalized
+        .chars()
+        .rev()
+        .take_while(|c| c.is_whitespace())
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+
+    let translated = translations
+        .get(trimmed)
+        .cloned()
+        .unwrap_or_else(|| trimmed.to_string());
+    Some(format!("{}{}{}", leading_ws, translated, trailing_ws))
+}
+
 fn extract_text_from_html(html: &str) -> Vec<String> {
     let texts = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-    let stack = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-    let stack_for_element = stack.clone();
+    let stack = std::rc::Rc::new(std::cell::RefCell::new(Vec::<CaptureFrame>::new()));
+    let stack_for_blocks = stack.clone();
+    let stack_for_blocks_end = stack.clone();
+    let texts_for_blocks_end = texts.clone();
+    let stack_for_spans = stack.clone();
+    let stack_for_spans_end = stack.clone();
+    let texts_for_spans_end = texts.clone();
     let stack_for_text = stack.clone();
-    let texts_for_end = texts.clone();
 
     let mut rewriter = HtmlRewriter::new(
         Settings {
             element_content_handlers: vec![
-                element!("p,li,h1,h2,h3,h4,h5,h6", move |el| {
-                    stack_for_element.borrow_mut().push(String::new());
+                element!(BLOCK_TEXT_CONTAINERS, move |el| {
+                    push_capture_frame(&stack_for_blocks, CaptureKind::Block);
                     if let Some(handlers) = el.end_tag_handlers() {
-                        let stack_for_end = stack_for_element.clone();
-                        let texts_for_end = texts_for_end.clone();
+                        let stack_for_end = stack_for_blocks_end.clone();
+                        let texts_for_end = texts_for_blocks_end.clone();
                         handlers.push(Box::new(move |_end| {
-                            if let Some(content) = stack_for_end.borrow_mut().pop() {
-                                let normalized = content.replace("&nbsp;", " ");
-                                let trimmed = normalized.trim();
-                                if !trimmed.is_empty() {
-                                    texts_for_end.borrow_mut().push(trimmed.to_string());
+                            if let Some((frame, has_block_ancestor)) =
+                                pop_capture_frame(&stack_for_end)
+                            {
+                                if should_emit_frame(&frame, has_block_ancestor) {
+                                    if let Some(normalized) = normalized_segment(&frame.text) {
+                                        texts_for_end.borrow_mut().push(normalized);
+                                    }
                                 }
                             }
                             Ok(())
                         }));
+                    } else {
+                        let _ = pop_capture_frame(&stack_for_blocks);
                     }
                     Ok(())
                 }),
-                text!("p,li,h1,h2,h3,h4,h5,h6", move |chunk| {
+                element!(INLINE_TEXT_CONTAINERS, move |el| {
+                    let should_capture = {
+                        let frames = stack_for_spans.borrow();
+                        let has_block_ancestor =
+                            frames.iter().any(|frame| frame.kind == CaptureKind::Block);
+                        let has_span_ancestor =
+                            frames.iter().any(|frame| frame.kind == CaptureKind::Span);
+                        !has_block_ancestor && !has_span_ancestor
+                    };
+
+                    if should_capture {
+                        push_capture_frame(&stack_for_spans, CaptureKind::Span);
+                    }
+
+                    if let Some(handlers) = el.end_tag_handlers() {
+                        let stack_for_end = stack_for_spans_end.clone();
+                        let texts_for_end = texts_for_spans_end.clone();
+                        handlers.push(Box::new(move |_end| {
+                            if should_capture {
+                                if let Some((frame, has_block_ancestor)) =
+                                    pop_capture_frame(&stack_for_end)
+                                {
+                                    if should_emit_frame(&frame, has_block_ancestor) {
+                                        if let Some(normalized) = normalized_segment(&frame.text) {
+                                            texts_for_end.borrow_mut().push(normalized);
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(())
+                        }));
+                    } else if should_capture {
+                        let _ = pop_capture_frame(&stack_for_spans);
+                    }
+
+                    Ok(())
+                }),
+                text!(TRANSLATABLE_TEXT_CONTAINERS, move |chunk| {
                     if chunk.text_type() == TextType::Data {
-                        if let Some(current) = stack_for_text.borrow_mut().last_mut() {
-                            current.push_str(chunk.as_str());
+                        let text = chunk.as_str();
+                        if !text.is_empty() {
+                            let mut frames = stack_for_text.borrow_mut();
+                            for frame in frames.iter_mut() {
+                                frame.text.push_str(text);
+                            }
                         }
                     }
                     Ok(())
@@ -229,52 +370,91 @@ fn rewrite_html_with_translations(
 ) -> Vec<u8> {
     let mut output = Vec::with_capacity(bytes.len());
 
-    let stack = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-    let stack_for_element = stack.clone();
+    let stack = std::rc::Rc::new(std::cell::RefCell::new(Vec::<CaptureFrame>::new()));
+    let stack_for_blocks = stack.clone();
+    let stack_for_blocks_end = stack.clone();
+    let translations_for_blocks_end = translations.clone();
+    let stack_for_spans = stack.clone();
+    let stack_for_spans_end = stack.clone();
+    let translations_for_spans_end = translations.clone();
     let stack_for_text = stack.clone();
-    let translations_for_end = translations.clone();
 
     let mut rewriter = HtmlRewriter::new(
         Settings {
             element_content_handlers: vec![
-                element!("p,li,h1,h2,h3,h4,h5,h6", move |el| {
-                    stack_for_element.borrow_mut().push(String::new());
+                element!(BLOCK_TEXT_CONTAINERS, move |el| {
+                    push_capture_frame(&stack_for_blocks, CaptureKind::Block);
                     if let Some(handlers) = el.end_tag_handlers() {
-                        let stack_for_end = stack_for_element.clone();
-                        let translations_for_end = translations_for_end.clone();
+                        let stack_for_end = stack_for_blocks_end.clone();
+                        let translations_for_end = translations_for_blocks_end.clone();
                         handlers.push(Box::new(move |end| {
-                            if let Some(content) = stack_for_end.borrow_mut().pop() {
-                                let normalized = content.replace("&nbsp;", " ");
-                                let trimmed = normalized.trim();
-                                if trimmed.is_empty() {
-                                    return Ok(());
+                            if let Some((frame, has_block_ancestor)) =
+                                pop_capture_frame(&stack_for_end)
+                            {
+                                if should_emit_frame(&frame, has_block_ancestor) {
+                                    if let Some(result) = translated_segment(
+                                        &frame.text,
+                                        translations_for_end.as_ref(),
+                                    ) {
+                                        end.before(&result, ContentType::Text);
+                                    }
                                 }
-
-                                let leading_ws: String = normalized
-                                    .chars()
-                                    .take_while(|c| c.is_whitespace())
-                                    .collect();
-                                let trailing_ws: String = normalized
-                                    .chars()
-                                    .rev()
-                                    .take_while(|c| c.is_whitespace())
-                                    .collect();
-                                let translated = translations_for_end
-                                    .get(trimmed)
-                                    .cloned()
-                                    .unwrap_or_else(|| trimmed.to_string());
-                                let result = format!("{}{}{}", leading_ws, translated, trailing_ws);
-                                end.before(&result, ContentType::Text);
                             }
                             Ok(())
                         }));
+                    } else {
+                        let _ = pop_capture_frame(&stack_for_blocks);
                     }
                     Ok(())
                 }),
-                text!("p,li,h1,h2,h3,h4,h5,h6", move |chunk| {
+                element!(INLINE_TEXT_CONTAINERS, move |el| {
+                    let should_capture = {
+                        let frames = stack_for_spans.borrow();
+                        let has_block_ancestor =
+                            frames.iter().any(|frame| frame.kind == CaptureKind::Block);
+                        let has_span_ancestor =
+                            frames.iter().any(|frame| frame.kind == CaptureKind::Span);
+                        !has_block_ancestor && !has_span_ancestor
+                    };
+
+                    if should_capture {
+                        push_capture_frame(&stack_for_spans, CaptureKind::Span);
+                    }
+
+                    if let Some(handlers) = el.end_tag_handlers() {
+                        let stack_for_end = stack_for_spans_end.clone();
+                        let translations_for_end = translations_for_spans_end.clone();
+                        handlers.push(Box::new(move |end| {
+                            if should_capture {
+                                if let Some((frame, has_block_ancestor)) =
+                                    pop_capture_frame(&stack_for_end)
+                                {
+                                    if should_emit_frame(&frame, has_block_ancestor) {
+                                        if let Some(result) = translated_segment(
+                                            &frame.text,
+                                            translations_for_end.as_ref(),
+                                        ) {
+                                            end.before(&result, ContentType::Text);
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(())
+                        }));
+                    } else if should_capture {
+                        let _ = pop_capture_frame(&stack_for_spans);
+                    }
+
+                    Ok(())
+                }),
+                text!(TRANSLATABLE_TEXT_CONTAINERS, move |chunk| {
                     if chunk.text_type() == TextType::Data {
-                        if let Some(current) = stack_for_text.borrow_mut().last_mut() {
-                            current.push_str(chunk.as_str());
+                        let text = chunk.as_str();
+                        let mut frames = stack_for_text.borrow_mut();
+                        if !frames.is_empty() {
+                            for frame in frames.iter_mut() {
+                                frame.text.push_str(text);
+                            }
                             chunk.replace("", ContentType::Text);
                         }
                     }
