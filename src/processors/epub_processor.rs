@@ -1,17 +1,22 @@
 use crate::processors::epub_rebuild::{output_path_with_locale, rebuild_epub_with, RebuildError};
 use crate::translate::{translate_texts_with_cancel, LlamaState, TranslateError};
-use epub::doc::{DocError, EpubDoc};
 use lol_html::html_content::{ContentType, TextType};
 use lol_html::{element, text, HtmlRewriter, Settings};
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
+use zip::ZipArchive;
 
 #[derive(Debug, Error)]
 pub enum ProcessError {
     #[error(transparent)]
-    Doc(#[from] DocError),
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Zip(#[from] zip::result::ZipError),
     #[error(transparent)]
     Rebuild(#[from] RebuildError),
     #[error(transparent)]
@@ -24,6 +29,7 @@ pub enum ProcessError {
 
 #[derive(Debug, Clone)]
 pub struct TextSegment {
+    pub file_name: String,
     pub text: String,
 }
 
@@ -33,19 +39,25 @@ pub struct ExtractionResult {
 }
 
 pub fn extract_text_segments<P: AsRef<Path>>(path: P) -> Result<ExtractionResult, ProcessError> {
-    let mut doc = EpubDoc::new(path)?;
+    let input_file = File::open(path.as_ref())?;
+    let mut archive = ZipArchive::new(input_file)?;
     let mut segments = Vec::new();
     let mut total_words = 0;
 
-    for spine_item in doc.spine.clone() {
-        let Some((html, mime)) = doc.get_resource_str(&spine_item.idref) else {
-            continue;
-        };
-        if !mime.contains("html") && !mime.contains("xhtml") {
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i)?;
+        let name = entry.name().to_string();
+        if entry.is_dir() || !is_html_name(&name) {
             continue;
         }
 
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes)?;
+        let html = String::from_utf8_lossy(&bytes);
         let texts = extract_text_from_html(&html);
+        if texts.is_empty() {
+            continue;
+        }
 
         for text in texts {
             let text = text.trim();
@@ -57,6 +69,7 @@ pub fn extract_text_segments<P: AsRef<Path>>(path: P) -> Result<ExtractionResult
             total_words += words;
 
             segments.push(TextSegment {
+                file_name: name.clone(),
                 text: text.to_string(),
             });
         }
@@ -140,44 +153,50 @@ where
         }
     }
 
-    let source_segments: Vec<String> = extraction
-        .segments
-        .iter()
-        .map(|segment| segment.text.clone())
-        .collect();
+    let mut file_translations: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    for (idx, segment) in extraction.segments.iter().enumerate() {
+        let translated = translated_segments
+            .get(idx)
+            .cloned()
+            .unwrap_or_else(|| segment.text.clone());
+        file_translations
+            .entry(segment.file_name.clone())
+            .or_default()
+            .push((segment.text.clone(), translated));
+    }
 
-    let source_segments = Arc::new(source_segments);
-    let translated_segments = Arc::new(translated_segments);
-    let cursor = Arc::new(Mutex::new(0usize));
+    let file_translations = Arc::new(file_translations);
     let mapping_mismatch = Arc::new(AtomicBool::new(false));
 
     rebuild_epub_with(input_path, &output_path, |name, bytes| {
         if is_html_name(name) {
-            let mut cursor = cursor.lock().ok()?;
             let html = String::from_utf8_lossy(bytes);
             let extracted = extract_text_from_html(&html);
-            let start = *cursor;
-            let end = start.saturating_add(extracted.len());
-            let expected = match source_segments.get(start..end) {
+
+            let expected_pairs = match file_translations.get(name) {
                 Some(value) => value,
                 None => {
+                    if extracted.is_empty() {
+                        return None;
+                    }
                     mapping_mismatch.store(true, Ordering::SeqCst);
                     return None;
                 }
             };
-            if expected != extracted {
+
+            if expected_pairs.len() != extracted.len() {
                 mapping_mismatch.store(true, Ordering::SeqCst);
                 return None;
             }
 
-            let replacements = match translated_segments.get(start..end) {
-                Some(value) => value.iter().cloned().collect::<Vec<String>>(),
-                None => {
+            let mut replacements = Vec::with_capacity(extracted.len());
+            for (actual, (expected, translated)) in extracted.iter().zip(expected_pairs.iter()) {
+                if actual != expected {
                     mapping_mismatch.store(true, Ordering::SeqCst);
                     return None;
                 }
-            };
-            *cursor = end;
+                replacements.push(translated.clone());
+            }
 
             Some(rewrite_html_with_translations(
                 bytes,
@@ -188,10 +207,7 @@ where
         }
     })?;
 
-    let consumed = *cursor
-        .lock()
-        .map_err(|_| ProcessError::TranslationMappingMismatch)?;
-    if consumed != total || mapping_mismatch.load(Ordering::SeqCst) {
+    if mapping_mismatch.load(Ordering::SeqCst) {
         return Err(ProcessError::TranslationMappingMismatch);
     }
 

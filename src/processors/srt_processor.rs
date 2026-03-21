@@ -71,7 +71,8 @@ where
         let batch = &contexts[start..end];
         let prompt_texts: Vec<String> = batch
             .iter()
-            .map(|ctx| build_contextual_prompt(ctx, &contexts))
+            .enumerate()
+            .map(|(offset, ctx)| build_contextual_prompt(ctx, &contexts, start + offset))
             .collect();
 
         let translated_batch = translate_texts_with_cancel(
@@ -92,12 +93,14 @@ where
                 .cloned()
                 .unwrap_or_else(|| cue_ctx.text.clone());
 
-            let parsed = extract_current_translation(&raw).and_then(|value| {
+            let parsed = extract_current_translation(&raw, cue_ctx).and_then(|value| {
                 split_translated_lines(&value, cue_line_count(&cues[cue_ctx.cue_index]))
             });
 
-            let translated_lines =
-                parsed.unwrap_or_else(|| cues[cue_ctx.cue_index].text_lines.clone());
+            let source_lines = cues[cue_ctx.cue_index].text_lines.clone();
+            let translated_lines = parsed
+                .map(|lines| apply_source_formatting(&source_lines, lines))
+                .unwrap_or(source_lines);
             translated_cues[start + offset] = Some(translated_lines);
             done += 1;
             on_progress(done, total);
@@ -138,10 +141,7 @@ fn parse_srt(content: &str) -> Result<Vec<SrtCue>, SrtProcessError> {
             return Err(SrtProcessError::MalformedCue);
         }
 
-        let text_lines: Vec<String> = lines
-            .map(str::to_string)
-            .filter(|line| !line.trim().is_empty())
-            .collect();
+        let text_lines: Vec<String> = lines.map(str::to_string).collect();
 
         cues.push(SrtCue {
             index: index.to_string(),
@@ -200,12 +200,7 @@ fn build_cue_contexts(cues: &[SrtCue]) -> Vec<CueContext> {
         .collect()
 }
 
-fn build_contextual_prompt(unit: &CueContext, units: &[CueContext]) -> String {
-    let unit_pos = units
-        .iter()
-        .position(|u| u.cue_index == unit.cue_index)
-        .unwrap_or(0);
-
+fn build_contextual_prompt(unit: &CueContext, units: &[CueContext], unit_pos: usize) -> String {
     let prev = if unit_pos > 0 {
         units[unit_pos - 1].text.as_str()
     } else {
@@ -230,7 +225,7 @@ fn build_contextual_prompt(unit: &CueContext, units: &[CueContext]) -> String {
     }
 }
 
-fn extract_current_translation(raw: &str) -> Option<String> {
+fn extract_current_translation(raw: &str, cue_ctx: &CueContext) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return None;
@@ -242,12 +237,137 @@ fn extract_current_translation(raw: &str) -> Option<String> {
             let value_start = start + "<translated>".len();
             let value = trimmed[value_start..end].trim();
             if !value.is_empty() {
-                return Some(value.to_string());
+                if let Some(code_block) = extract_first_code_fence(value) {
+                    return Some(code_block);
+                }
+                return sanitize_model_output(value, cue_ctx);
             }
         }
     }
 
-    Some(trimmed.to_string())
+    if let Some(code_block) = extract_first_code_fence(trimmed) {
+        return Some(code_block);
+    }
+
+    sanitize_model_output(trimmed, cue_ctx)
+}
+
+fn extract_first_code_fence(raw: &str) -> Option<String> {
+    let mut in_fence = false;
+    let mut lines = Vec::new();
+
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            if in_fence {
+                let content = lines.join("\n").trim().to_string();
+                if !content.is_empty() {
+                    return Some(content);
+                }
+                in_fence = false;
+                lines.clear();
+                continue;
+            }
+
+            in_fence = true;
+            continue;
+        }
+
+        if in_fence {
+            lines.push(line.trim_end().to_string());
+        }
+    }
+
+    None
+}
+
+fn sanitize_model_output(raw: &str, cue_ctx: &CueContext) -> Option<String> {
+    let mut lines = Vec::new();
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.starts_with("<context_")
+            || lower.starts_with("</context_")
+            || lower == "<current>"
+            || lower == "</current>"
+            || lower.starts_with("translate this")
+            || lower.starts_with("return only")
+            || lower.starts_with("you are translating")
+            || trimmed.starts_with("```")
+        {
+            continue;
+        }
+        if trimmed.starts_with('<') && trimmed.ends_with('>') {
+            continue;
+        }
+        lines.push(trimmed.to_string());
+    }
+
+    if lines.is_empty() {
+        return Some(cue_ctx.text.clone());
+    }
+
+    Some(lines.join("\n"))
+}
+
+fn apply_source_formatting(source_lines: &[String], translated_lines: Vec<String>) -> Vec<String> {
+    if source_lines.is_empty() {
+        return translated_lines;
+    }
+
+    let max_lines = source_lines.len().max(1);
+    let mut aligned = if translated_lines.len() <= max_lines {
+        translated_lines
+    } else {
+        vec![translated_lines.join(" ")]
+    };
+
+    if aligned.is_empty() {
+        return source_lines.to_vec();
+    }
+
+    for (idx, line) in aligned.iter_mut().enumerate() {
+        let source = source_lines
+            .get(idx)
+            .map(String::as_str)
+            .unwrap_or_else(|| source_lines.last().map(String::as_str).unwrap_or(""));
+        *line = preserve_speaker_prefix(source, line);
+        *line = preserve_simple_inline_wrappers(source, line);
+    }
+
+    aligned
+}
+
+fn preserve_speaker_prefix(source: &str, translated: &str) -> String {
+    let source_trimmed = source.trim_start();
+    let translated_trimmed = translated.trim_start();
+    if source_trimmed.starts_with("- ") && !translated_trimmed.starts_with('-') {
+        return format!("- {}", translated_trimmed);
+    }
+    if source_trimmed.starts_with("– ") && !translated_trimmed.starts_with('–') {
+        return format!("– {}", translated_trimmed);
+    }
+    translated.to_string()
+}
+
+fn preserve_simple_inline_wrappers(source: &str, translated: &str) -> String {
+    let source_trimmed = source.trim();
+    let translated_trimmed = translated.trim();
+    for tag in ["i", "b", "u"] {
+        let open = format!("<{tag}>");
+        let close = format!("</{tag}>");
+        if source_trimmed.starts_with(&open)
+            && source_trimmed.ends_with(&close)
+            && !(translated_trimmed.starts_with(&open) && translated_trimmed.ends_with(&close))
+        {
+            return format!("{open}{translated_trimmed}{close}");
+        }
+    }
+
+    translated.to_string()
 }
 
 fn apply_translations(

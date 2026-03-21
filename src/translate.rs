@@ -4,11 +4,10 @@ use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::{BatchAddError, LlamaBatch};
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaModel};
-use llama_cpp_2::token::data::LlamaTokenData;
-use llama_cpp_2::token::data_array::LlamaTokenDataArray;
 use llama_cpp_2::token::LlamaToken;
 use llama_cpp_2::{
-    DecodeError, LlamaContextLoadError, LlamaCppError, LlamaModelLoadError, TokenToStringError,
+    DecodeError, LlamaContextLoadError, LlamaCppError, LlamaModelLoadError, StringToTokenError,
+    TokenToStringError,
 };
 use std::collections::HashMap;
 use std::env;
@@ -65,6 +64,8 @@ pub enum TranslateError {
     KvCache(#[from] KvCacheConversionError),
     #[error(transparent)]
     TokenToString(#[from] TokenToStringError),
+    #[error(transparent)]
+    Tokenize(#[from] StringToTokenError),
     #[error("unsupported locale: {0}")]
     UnsupportedLocale(String),
     #[error("llama state lock poisoned")]
@@ -367,13 +368,7 @@ fn run_batch_with_tokens(
             }
 
             let logits = state.ctx.get_logits_ith(logits_indices[seq_index]);
-            let mut data_array = LlamaTokenDataArray::from_iter(
-                (0..state.model.n_vocab())
-                    .zip(logits.iter())
-                    .map(|(i, logit)| LlamaTokenData::new(LlamaToken::new(i), *logit, 0.0)),
-                false,
-            );
-            let token = data_array.sample_token_greedy();
+            let token = greedy_token_from_logits(logits);
             if state.model.is_eog_token(token) {
                 active[seq_index] = false;
                 continue;
@@ -459,10 +454,7 @@ fn ensure_suffix_cached(state: &mut LlamaState) {
         return;
     }
 
-    let suffix_tokens = state
-        .model
-        .str_to_token(PROMPT_SUFFIX, AddBos::Never)
-        .unwrap_or_default();
+    let suffix_tokens = tokenize_text(state, PROMPT_SUFFIX).unwrap_or_default();
     state.cached_prompt_suffix_len = suffix_tokens.len();
     state.cached_prompt_suffix_tokens = suffix_tokens;
 }
@@ -471,16 +463,12 @@ fn ensure_prefix_cached(state: &mut LlamaState, prompt_prefix: &str) -> Translat
     if state.cached_prefix.as_deref() == Some(prompt_prefix) {
         return Ok(state.cached_prefix_len);
     }
-    println!("Updating cached prompt prefix...");
 
     state.ctx.clear_kv_cache();
     state.cached_prefix = None;
     state.cached_prefix_len = 0;
 
-    let prefix_tokens = state
-        .model
-        .str_to_token(prompt_prefix, AddBos::Never)
-        .unwrap_or_default();
+    let prefix_tokens = tokenize_text(state, prompt_prefix)?;
     let prefix_tokens_len = prefix_tokens.len();
     if prefix_tokens_len > 0 {
         let mut prefix_batch = LlamaBatch::new(prefix_tokens_len, 1);
@@ -561,15 +549,13 @@ fn split_into_sentences(text: &str) -> Vec<String> {
     sentences
 }
 
-fn tokenize_text(state: &LlamaState, text: &str) -> Vec<LlamaToken> {
+fn tokenize_text(state: &LlamaState, text: &str) -> TranslateResult<Vec<LlamaToken>> {
     if text.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
-    state
-        .model
-        .str_to_token(text, AddBos::Never)
-        .unwrap_or_default()
+    let tokens = state.model.str_to_token(text, AddBos::Never)?;
+    Ok(tokens)
 }
 
 fn token_len_cached(state: &LlamaState, cache: &mut HashMap<String, usize>, text: &str) -> usize {
@@ -581,7 +567,7 @@ fn token_len_cached(state: &LlamaState, cache: &mut HashMap<String, usize>, text
         return len;
     }
 
-    let len = tokenize_text(state, text).len();
+    let len = tokenize_text(state, text).map(|v| v.len()).unwrap_or(0);
     cache.insert(text.to_string(), len);
     len
 }
@@ -602,7 +588,7 @@ fn split_text_to_fit(text: &str, state: &LlamaState, limits: &BatchLimits) -> Ve
         let tokens = tokenize_text(state, text);
         return vec![TextChunk {
             text: text.to_string(),
-            tokens,
+            tokens: tokens.unwrap_or_default(),
             tokens_len: full_len,
         }];
     }
@@ -640,7 +626,7 @@ fn split_text_to_fit(text: &str, state: &LlamaState, limits: &BatchLimits) -> Ve
 
         if !current.is_empty() {
             let chunk_text = std::mem::take(&mut current);
-            let chunk_tokens = tokenize_text(state, &chunk_text);
+            let chunk_tokens = tokenize_text(state, &chunk_text).unwrap_or_default();
             sentences.push(TextChunk {
                 text: chunk_text,
                 tokens: chunk_tokens,
@@ -671,7 +657,7 @@ fn split_text_to_fit(text: &str, state: &LlamaState, limits: &BatchLimits) -> Ve
                 let chunk_tokens = tokenize_text(state, chunk);
                 sentences.push(TextChunk {
                     text: chunk.to_string(),
-                    tokens: chunk_tokens,
+                    tokens: chunk_tokens.unwrap_or_default(),
                     tokens_len: chunk_len,
                 });
                 remaining = remaining[chunk.len()..].trim_start().to_string();
@@ -684,7 +670,7 @@ fn split_text_to_fit(text: &str, state: &LlamaState, limits: &BatchLimits) -> Ve
         let current_tokens = tokenize_text(state, &current);
         sentences.push(TextChunk {
             text: current,
-            tokens: current_tokens,
+            tokens: current_tokens.unwrap_or_default(),
             tokens_len: current_len,
         });
     }
@@ -783,6 +769,16 @@ fn token_bytes_resilient(model: &LlamaModel, token: LlamaToken) -> Vec<u8> {
     }
 
     Vec::new()
+}
+
+fn greedy_token_from_logits(logits: &[f32]) -> LlamaToken {
+    let best = logits
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.total_cmp(b.1))
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    LlamaToken::new(best as i32)
 }
 
 fn locale_to_lang(locale: &str) -> Result<(String, String), TranslateError> {

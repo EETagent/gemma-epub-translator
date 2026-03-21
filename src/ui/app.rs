@@ -7,7 +7,6 @@ use cacao::appkit::window::{WindowConfig, WindowDelegate};
 use cacao::appkit::{App, AppDelegate};
 use cacao::events::EventModifierFlag;
 use cacao::foundation::id;
-use cacao::foundation::nil;
 use cacao::layout::{Layout, LayoutConstraint};
 use cacao::notification_center::Dispatcher;
 use cacao::objc::msg_send;
@@ -135,8 +134,7 @@ impl TranslatorApp {
 impl TabViewDelegate for TranslatorApp {
     const NAME: &'static str = "TranslatorAppTabViewDelegate";
 
-    fn did_select_tab_view_item(&self, _item: &TabViewItem) {
-    }
+    fn did_select_tab_view_item(&self, _item: &TabViewItem) {}
 }
 
 impl AppDelegate for TranslatorApp {
