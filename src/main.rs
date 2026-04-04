@@ -1,3 +1,4 @@
+mod locale;
 mod processors;
 mod translate;
 mod ui;

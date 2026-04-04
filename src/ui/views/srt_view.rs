@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use crate::locale::{SOURCE_LANGUAGES, TARGET_LANGUAGES};
 use crate::processors::srt_processor::{translate_srt_with_cancel, SrtProcessError};
 use crate::translate::LlamaState;
 use crate::ui::app::{AppMessage, TranslationKind, TranslatorApp};
@@ -78,19 +79,6 @@ pub struct SrtView {
 pub struct ContentView {
     ui: Rc<RefCell<SharedUi>>,
 }
-
-const SOURCE_LANGUAGES: &[(&str, &str)] = &[
-    ("US English", "en-US"),
-    ("UK English", "en-GB"),
-    ("German", "de"),
-    ("Slovak", "sk"),
-    ("Spanish", "es"),
-    ("Russian", "ru"),
-    ("Danish", "da"),
-    ("Czech", "cs"),
-];
-
-const TARGET_LANGUAGES: &[(&str, &str)] = &[("Czech", "cs"), ("English", "en-US")];
 
 impl ContentView {
     fn srt_paths_from_drag(info: &DragInfo) -> Vec<PathBuf> {

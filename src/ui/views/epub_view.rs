@@ -24,6 +24,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use crate::locale::{SOURCE_LANGUAGES, TARGET_LANGUAGES};
 use crate::processors::epub_processor::{
     extract_text_segments, translate_epub_with_cancel, ProcessError,
 };
@@ -100,19 +101,6 @@ impl ContentView {
             .collect()
     }
 }
-
-const SOURCE_LANGUAGES: &[(&str, &str)] = &[
-    ("US English", "en-US"),
-    ("UK English", "en-GB"),
-    ("German", "de"),
-    ("Slovak", "sk"),
-    ("Spanish", "es"),
-    ("Russian", "ru"),
-    ("Danish", "da"),
-    ("Czech", "cs"),
-];
-
-const TARGET_LANGUAGES: &[(&str, &str)] = &[("Czech", "cs"), ("English", "en-US")];
 
 impl ViewDelegate for ContentView {
     const NAME: &'static str = "EpubViewContent";
