@@ -5,6 +5,7 @@ use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::{BatchAddError, LlamaBatch};
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaModel};
+use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::token::LlamaToken;
 use llama_cpp_2::{
     DecodeError, LlamaContextLoadError, LlamaCppError, LlamaModelLoadError, StringToTokenError,
@@ -395,6 +396,8 @@ fn run_batch_with_tokens(
         .map(|tokens| (prefix_len + tokens.len()) as i32)
         .collect();
     let mut active = vec![true; seq_count];
+    let mut sampler = LlamaSampler::greedy();
+
     for _ in 0..max_output_tokens {
         if let Some(flag) = cancel_flag {
             if !flag.load(Ordering::SeqCst) {
@@ -415,8 +418,7 @@ fn run_batch_with_tokens(
                 continue;
             }
 
-            let logits = state.ctx.get_logits_ith(logits_indices[seq_index]);
-            let token = greedy_token_from_logits(logits);
+            let token = sampler.sample(&state.ctx, logits_indices[seq_index]);
             if state.model.is_eog_token(token) {
                 active[seq_index] = false;
                 continue;
@@ -930,16 +932,6 @@ fn token_bytes_resilient(model: &LlamaModel, token: LlamaToken) -> Vec<u8> {
     }
 
     Vec::new()
-}
-
-fn greedy_token_from_logits(logits: &[f32]) -> LlamaToken {
-    let best = logits
-        .iter()
-        .enumerate()
-        .max_by(|a, b| a.1.total_cmp(b.1))
-        .map(|(i, _)| i)
-        .unwrap_or(0);
-    LlamaToken::new(best as i32)
 }
 
 fn tokens_end_with(tokens: &[LlamaToken], suffix: &[LlamaToken]) -> bool {
