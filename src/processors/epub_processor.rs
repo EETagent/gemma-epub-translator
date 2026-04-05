@@ -140,6 +140,13 @@ where
                 .cloned()
                 .unwrap_or_else(|| segment.text.clone());
             let index = start + offset;
+            println!(
+                "Translated {}/{}: {} -> {}",
+                index + 1,
+                total,
+                segment.text,
+                translated
+            );
             translated_segments[index] = translated;
             on_progress(index + 1, total);
         }
