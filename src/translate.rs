@@ -27,6 +27,7 @@ const SHORT_OUTPUT_TOKENS: usize = 16;
 const SHORT_INPUT_TOKENS: usize = 4;
 const MAX_SEQ_BATCH: usize = 8 * 2;
 const STOP_SEQUENCE: &str = "<end_of_turn>";
+const SRT_STOP_SEQUENCE: &str = "</translated>";
 
 const PROMPT_USER_TURN_PREFIX: &str = "<bos><start_of_turn>user\n";
 const TRANSLATOR_ROLE_LAYER_TEMPLATE: &str = "You are a professional {SOURCE_LANG} ({SOURCE_CODE}) to {TARGET_LANG} ({TARGET_CODE}) translator. Your goal is to accurately convey the meaning and nuances of the original {SOURCE_LANG} text while adhering to {TARGET_LANG} grammar, vocabulary, and cultural sensitivities.\n";
@@ -47,6 +48,7 @@ pub struct LlamaState {
     backend: LlamaBackend,
     max_seq_batch: usize,
     stop_tokens: Vec<LlamaToken>,
+    srt_stop_tokens: Vec<LlamaToken>,
     cached_prefix: Option<String>,
     cached_prefix_len: usize,
     cached_prompt_suffix_len: usize,
@@ -121,7 +123,7 @@ pub fn translate_texts_with_srt_prompt_with_cancel(
     cancel_flag: Option<&Arc<AtomicBool>>,
 ) -> Result<Vec<String>, TranslateError> {
     let prompt_prefix = build_srt_prompt_prefix(source_locale, target_locale)?;
-    translate_texts_with_prefix_and_cancel(state, texts, &prompt_prefix, cancel_flag)
+    translate_texts_with_prefix_and_cancel(state, texts, &prompt_prefix, cancel_flag, true)
 }
 
 pub struct BatchLimits {
@@ -155,7 +157,7 @@ pub fn translate_texts_with_cancel(
     cancel_flag: Option<&Arc<AtomicBool>>,
 ) -> Result<Vec<String>, TranslateError> {
     let prompt_prefix = build_epub_prompt_prefix(source_locale, target_locale)?;
-    translate_texts_with_prefix_and_cancel(state, texts, &prompt_prefix, cancel_flag)
+    translate_texts_with_prefix_and_cancel(state, texts, &prompt_prefix, cancel_flag, false)
 }
 
 fn translate_texts_with_prefix_and_cancel(
@@ -163,6 +165,7 @@ fn translate_texts_with_prefix_and_cancel(
     texts: &[String],
     prompt_prefix: &str,
     cancel_flag: Option<&Arc<AtomicBool>>,
+    use_srt_stop_sequence: bool,
 ) -> Result<Vec<String>, TranslateError> {
     if texts.is_empty() {
         return Ok(Vec::new());
@@ -182,6 +185,15 @@ fn translate_texts_with_prefix_and_cancel(
 
     ensure_suffix_cached(&mut state)?;
     ensure_prefix_cached(&mut state, prompt_prefix)?;
+
+    let stop_tokens = if use_srt_stop_sequence {
+        vec![
+            (state.srt_stop_tokens.clone(), false),
+            (state.stop_tokens.clone(), true),
+        ]
+    } else {
+        vec![(state.stop_tokens.clone(), true)]
+    };
 
     for (index, text) in texts.iter().enumerate() {
         if text.trim().is_empty() {
@@ -217,7 +229,7 @@ fn translate_texts_with_prefix_and_cancel(
         return Ok(outputs);
     }
 
-    match run_batch_inference(&mut state, &prompts, cancel_flag) {
+    match run_batch_inference(&mut state, &prompts, &stop_tokens, cancel_flag) {
         Ok(results) => {
             for (key, translated) in results {
                 if let Some(chunks) = chunk_results.get_mut(key.parent_index) {
@@ -254,6 +266,7 @@ fn translate_texts_with_prefix_and_cancel(
 fn run_batch_inference(
     state: &mut LlamaState,
     prompts: &[PreparedPrompt],
+    stop_tokens: &[(Vec<LlamaToken>, bool)],
     cancel_flag: Option<&Arc<AtomicBool>>,
 ) -> TranslateResult<Vec<(PromptKey, String)>> {
     let max_batch = state.ctx.n_batch() as usize;
@@ -320,6 +333,7 @@ fn run_batch_inference(
             prefix_len,
             &batch_tokens,
             batch_max_output,
+            stop_tokens,
             cancel_flag,
         )?;
         for (prompt_index, output) in batch_indices.into_iter().zip(outputs.into_iter()) {
@@ -340,9 +354,9 @@ fn run_batch_with_tokens(
     prefix_len: usize,
     prompt_tokens: &[&[LlamaToken]],
     max_output_tokens: usize,
+    stop_tokens: &[(Vec<LlamaToken>, bool)],
     cancel_flag: Option<&Arc<AtomicBool>>,
 ) -> TranslateResult<Vec<String>> {
-    let stop_len = state.stop_tokens.len();
     clear_transient_sequences(state)?;
 
     let total_tokens: usize = prompt_tokens.iter().map(|tokens| tokens.len()).sum();
@@ -405,15 +419,28 @@ fn run_batch_with_tokens(
             }
 
             output_tokens[seq_index].push(token);
-            if stop_len > 0
-                && output_tokens[seq_index].len() >= stop_len
-                && tokens_end_with(&output_tokens[seq_index], &state.stop_tokens)
-            {
-                let new_len = output_tokens[seq_index].len().saturating_sub(stop_len);
-                output_tokens[seq_index].truncate(new_len);
-                active[seq_index] = false;
+            let mut stop_hit = false;
+            for (suffix, truncate_output) in stop_tokens {
+                let stop_len = suffix.len();
+                if stop_len == 0 || output_tokens[seq_index].len() < stop_len {
+                    continue;
+                }
+
+                if tokens_end_with(&output_tokens[seq_index], suffix) {
+                    if *truncate_output {
+                        let new_len = output_tokens[seq_index].len().saturating_sub(stop_len);
+                        output_tokens[seq_index].truncate(new_len);
+                    }
+                    active[seq_index] = false;
+                    stop_hit = true;
+                    break;
+                }
+            }
+
+            if stop_hit {
                 continue;
             }
+
             next_tokens.push(token);
             active_indices.push(seq_index);
         }
@@ -463,6 +490,7 @@ fn init_state() -> Result<LlamaState, TranslateError> {
 
     let ctx = model_ref.new_context(&backend, ctx_params)?;
     let stop_tokens = model_ref.str_to_token(STOP_SEQUENCE, AddBos::Never)?;
+    let srt_stop_tokens = model_ref.str_to_token(SRT_STOP_SEQUENCE, AddBos::Never)?;
 
     Ok(LlamaState {
         backend,
@@ -470,6 +498,7 @@ fn init_state() -> Result<LlamaState, TranslateError> {
         ctx,
         max_seq_batch: MAX_SEQ_BATCH,
         stop_tokens,
+        srt_stop_tokens,
         cached_prefix: None,
         cached_prefix_len: 0,
         cached_prompt_suffix_len: 0,
