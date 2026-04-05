@@ -28,8 +28,17 @@ const SHORT_INPUT_TOKENS: usize = 4;
 const MAX_SEQ_BATCH: usize = 8 * 2;
 const STOP_SEQUENCE: &str = "<end_of_turn>";
 
-const PROMPT_PREFIX_TEMPLATE: &str = "<bos><start_of_turn>user\nYou are a professional {SOURCE_LANG} ({SOURCE_CODE}) to {TARGET_LANG} ({TARGET_CODE}) translator. Your goal is to accurately convey the meaning and nuances of the original {SOURCE_LANG} text while adhering to {TARGET_LANG} grammar, vocabulary, and cultural sensitivities.\nProduce only the {TARGET_LANG} translation, without any additional explanations or commentary. Please translate the following {SOURCE_LANG} text into {TARGET_LANG}:\n\n\n";
+const PROMPT_USER_TURN_PREFIX: &str = "<bos><start_of_turn>user\n";
+const TRANSLATOR_ROLE_LAYER_TEMPLATE: &str = "You are a professional {SOURCE_LANG} ({SOURCE_CODE}) to {TARGET_LANG} ({TARGET_CODE}) translator. Your goal is to accurately convey the meaning and nuances of the original {SOURCE_LANG} text while adhering to {TARGET_LANG} grammar, vocabulary, and cultural sensitivities.\n";
+const EPUB_TASK_LAYER_TEMPLATE: &str = "Produce only the {TARGET_LANG} translation, without any additional explanations or commentary. Please translate the following {SOURCE_LANG} text into {TARGET_LANG}:\n\n\n";
+const SRT_TASK_LAYER_TEMPLATE: &str = "Translate subtitle cues from {SOURCE_LANG} ({SOURCE_CODE}) into {TARGET_LANG} ({TARGET_CODE}). Preserve meaning, subtitle style, and line breaks when possible. Use surrounding cue context when available.\nTranslate only the text inside <current>. Use <context_prev> and <context_next> only for disambiguation.\nReturn ONLY the translated current cue wrapped as:\n<translated>...your translation...</translated>\nDo not output any text outside this wrapper.\n\n";
 const PROMPT_SUFFIX: &str = "<end_of_turn>\n<start_of_turn>model\n";
+
+#[derive(Clone, Copy, Debug)]
+enum PromptTaskKind {
+    Epub,
+    Srt,
+}
 
 pub struct LlamaState {
     ctx: llama_cpp_2::context::LlamaContext<'static>,
@@ -104,6 +113,17 @@ pub fn translate_texts_with_state(
     translate_texts_with_cancel(state, texts, source_locale, target_locale, None)
 }
 
+pub fn translate_texts_with_srt_prompt_with_cancel(
+    state: &Arc<Mutex<LlamaState>>,
+    texts: &[String],
+    source_locale: &str,
+    target_locale: &str,
+    cancel_flag: Option<&Arc<AtomicBool>>,
+) -> Result<Vec<String>, TranslateError> {
+    let prompt_prefix = build_srt_prompt_prefix(source_locale, target_locale)?;
+    translate_texts_with_prefix_and_cancel(state, texts, &prompt_prefix, cancel_flag)
+}
+
 pub struct BatchLimits {
     pub max_prompt_tokens: usize,
 }
@@ -134,6 +154,16 @@ pub fn translate_texts_with_cancel(
     target_locale: &str,
     cancel_flag: Option<&Arc<AtomicBool>>,
 ) -> Result<Vec<String>, TranslateError> {
+    let prompt_prefix = build_epub_prompt_prefix(source_locale, target_locale)?;
+    translate_texts_with_prefix_and_cancel(state, texts, &prompt_prefix, cancel_flag)
+}
+
+fn translate_texts_with_prefix_and_cancel(
+    state: &Arc<Mutex<LlamaState>>,
+    texts: &[String],
+    prompt_prefix: &str,
+    cancel_flag: Option<&Arc<AtomicBool>>,
+) -> Result<Vec<String>, TranslateError> {
     if texts.is_empty() {
         return Ok(Vec::new());
     }
@@ -149,10 +179,9 @@ pub fn translate_texts_with_cancel(
     let mut outputs = vec![String::new(); texts.len()];
     let mut prompts: Vec<PreparedPrompt> = Vec::new();
     let mut chunk_results: Vec<Vec<Option<String>>> = vec![Vec::new(); texts.len()];
-    let prompt_prefix = build_prompt_prefix(source_locale, target_locale)?;
 
     ensure_suffix_cached(&mut state)?;
-    ensure_prefix_cached(&mut state, &prompt_prefix)?;
+    ensure_prefix_cached(&mut state, prompt_prefix)?;
 
     for (index, text) in texts.iter().enumerate() {
         if text.trim().is_empty() {
@@ -494,15 +523,77 @@ fn clear_transient_sequences(state: &mut LlamaState) -> TranslateResult<()> {
     Ok(())
 }
 
-fn build_prompt_prefix(source_locale: &str, target_locale: &str) -> Result<String, TranslateError> {
+pub(crate) fn build_epub_prompt_prefix(
+    source_locale: &str,
+    target_locale: &str,
+) -> Result<String, TranslateError> {
+    build_prompt_prefix(source_locale, target_locale, PromptTaskKind::Epub)
+}
+
+pub(crate) fn build_srt_prompt_prefix(
+    source_locale: &str,
+    target_locale: &str,
+) -> Result<String, TranslateError> {
+    build_prompt_prefix(source_locale, target_locale, PromptTaskKind::Srt)
+}
+
+fn build_prompt_prefix(
+    source_locale: &str,
+    target_locale: &str,
+    task_kind: PromptTaskKind,
+) -> Result<String, TranslateError> {
+    let role_layer = build_translator_role_layer(source_locale, target_locale)?;
+    let task_layer = build_task_layer(source_locale, target_locale, task_kind)?;
+    Ok(format!("{PROMPT_USER_TURN_PREFIX}{role_layer}{task_layer}"))
+}
+
+fn build_translator_role_layer(
+    source_locale: &str,
+    target_locale: &str,
+) -> Result<String, TranslateError> {
     let (source_lang, source_code) = locale_to_lang(source_locale)?;
     let (target_lang, target_code) = locale_to_lang(target_locale)?;
+    Ok(fill_language_placeholders(
+        TRANSLATOR_ROLE_LAYER_TEMPLATE,
+        source_lang.as_str(),
+        source_code.as_str(),
+        target_lang.as_str(),
+        target_code.as_str(),
+    ))
+}
 
-    Ok(PROMPT_PREFIX_TEMPLATE
-        .replace("{SOURCE_LANG}", source_lang.as_str())
-        .replace("{SOURCE_CODE}", source_code.as_str())
-        .replace("{TARGET_LANG}", target_lang.as_str())
-        .replace("{TARGET_CODE}", target_code.as_str()))
+fn build_task_layer(
+    source_locale: &str,
+    target_locale: &str,
+    task_kind: PromptTaskKind,
+) -> Result<String, TranslateError> {
+    let (source_lang, source_code) = locale_to_lang(source_locale)?;
+    let (target_lang, target_code) = locale_to_lang(target_locale)?;
+    let template = match task_kind {
+        PromptTaskKind::Epub => EPUB_TASK_LAYER_TEMPLATE,
+        PromptTaskKind::Srt => SRT_TASK_LAYER_TEMPLATE,
+    };
+    Ok(fill_language_placeholders(
+        template,
+        source_lang.as_str(),
+        source_code.as_str(),
+        target_lang.as_str(),
+        target_code.as_str(),
+    ))
+}
+
+fn fill_language_placeholders(
+    template: &str,
+    source_lang: &str,
+    source_code: &str,
+    target_lang: &str,
+    target_code: &str,
+) -> String {
+    template
+        .replace("{SOURCE_LANG}", source_lang)
+        .replace("{SOURCE_CODE}", source_code)
+        .replace("{TARGET_LANG}", target_lang)
+        .replace("{TARGET_CODE}", target_code)
 }
 
 fn model_path() -> PathBuf {

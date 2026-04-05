@@ -1,4 +1,4 @@
-use crate::translate::{translate_texts_with_cancel, LlamaState};
+use crate::translate::{translate_texts_with_srt_prompt_with_cancel, LlamaState};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -72,10 +72,10 @@ where
         let prompt_texts: Vec<String> = batch
             .iter()
             .enumerate()
-            .map(|(offset, ctx)| build_contextual_prompt(ctx, &contexts, start + offset))
+            .map(|(offset, ctx)| build_cue_payload(ctx, &contexts, start + offset))
             .collect();
 
-        let translated_batch = translate_texts_with_cancel(
+        let translated_batch = translate_texts_with_srt_prompt_with_cancel(
             state,
             &prompt_texts,
             source_locale,
@@ -200,7 +200,7 @@ fn build_cue_contexts(cues: &[SrtCue]) -> Vec<CueContext> {
         .collect()
 }
 
-fn build_contextual_prompt(unit: &CueContext, units: &[CueContext], unit_pos: usize) -> String {
+fn build_cue_payload(unit: &CueContext, units: &[CueContext], unit_pos: usize) -> String {
     let prev = if unit_pos > 0 {
         units[unit_pos - 1].text.as_str()
     } else {
@@ -214,14 +214,11 @@ fn build_contextual_prompt(unit: &CueContext, units: &[CueContext], unit_pos: us
 
     if unit.is_short {
         format!(
-            "You are translating subtitle cues. Keep meaning and subtitle style. Preserve line breaks when possible.\n<context_prev>\n{prev}\n</context_prev>\n<context_next>\n{next}\n</context_next>\n<current>\n{}\n</current>\nReturn ONLY the translated current cue wrapped as:\n<translated>...your translation...</translated>",
+            "<context_prev>\n{prev}\n</context_prev>\n<context_next>\n{next}\n</context_next>\n<current>\n{}\n</current>",
             unit.text
         )
     } else {
-        format!(
-            "Translate this subtitle cue. Preserve subtitle style and line breaks.\n<current>\n{}\n</current>\nReturn ONLY:\n<translated>...your translation...</translated>",
-            unit.text
-        )
+        format!("<current>\n{}\n</current>", unit.text)
     }
 }
 
@@ -294,7 +291,10 @@ fn sanitize_model_output(raw: &str, cue_ctx: &CueContext) -> Option<String> {
             || lower == "<current>"
             || lower == "</current>"
             || lower.starts_with("translate this")
+            || lower.starts_with("translate subtitle cues")
+            || lower.starts_with("translate only the text inside")
             || lower.starts_with("return only")
+            || lower.starts_with("do not output any text outside")
             || lower.starts_with("you are translating")
             || trimmed.starts_with("```")
         {
