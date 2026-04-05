@@ -23,6 +23,13 @@ const MODEL_FILE: &str = "translategemma-12b-it.Q4_K_M.gguf";
 const CTX_SIZE: u32 = 2048 * 16;
 const N_BATCH: u32 = CTX_SIZE / MAX_SEQ_BATCH as u32;
 const MAX_OUTPUT_TOKENS: usize = 512 * 2;
+const MIN_OUTPUT_TOKENS: usize = 64;
+const OUTPUT_TOKENS_RATIO_NUM: usize = 135;
+const OUTPUT_TOKENS_RATIO_DEN: usize = 100;
+const OUTPUT_TOKENS_PADDING: usize = 8;
+const OUTPUT_TOKENS_BUCKETS: [usize; 13] = [
+    64, 96, 128, 160, 192, 256, 320, 384, 512, 640, 768, 896, 1024,
+];
 const SHORT_OUTPUT_TOKENS: usize = 16;
 const SHORT_INPUT_TOKENS: usize = 4;
 const MAX_SEQ_BATCH: usize = 8 * 2;
@@ -139,13 +146,13 @@ struct TextChunk {
 struct PreparedPrompt {
     key: PromptKey,
     prompt_tokens: Vec<LlamaToken>,
+    output_cap: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
 struct PromptKey {
     parent_index: usize,
     chunk_index: usize,
-    is_short_input: bool,
     is_single_word: bool,
 }
 
@@ -211,16 +218,17 @@ fn translate_texts_with_prefix_and_cancel(
         for (chunk_index, chunk) in chunks.into_iter().enumerate() {
             let is_short_input = is_short_input_text_with_len(chunk.tokens_len);
             let is_single_word = is_single_word_input(&chunk.text);
+            let output_cap = max_output_tokens_for_prompt(chunk.tokens_len, is_short_input);
             let mut prompt_tokens = chunk.tokens;
             prompt_tokens.extend_from_slice(&state.cached_prompt_suffix_tokens);
             prompts.push(PreparedPrompt {
                 key: PromptKey {
                     parent_index: index,
                     chunk_index,
-                    is_short_input,
                     is_single_word,
                 },
                 prompt_tokens,
+                output_cap,
             });
         }
     }
@@ -297,11 +305,7 @@ fn run_batch_inference(
             }
 
             let token_len = prompt.prompt_tokens.len();
-            let prompt_max_output = if prompt.key.is_short_input {
-                SHORT_OUTPUT_TOKENS
-            } else {
-                MAX_OUTPUT_TOKENS
-            };
+            let prompt_max_output = prompt.output_cap;
             if batch_tokens.len() >= max_sequences {
                 break;
             }
@@ -845,6 +849,30 @@ fn trim_to_fit(
 
 fn is_short_input_text_with_len(tokens_len: usize) -> bool {
     tokens_len <= SHORT_INPUT_TOKENS
+}
+
+fn max_output_tokens_for_prompt(input_tokens_len: usize, is_short_input: bool) -> usize {
+    if is_short_input {
+        return SHORT_OUTPUT_TOKENS;
+    }
+
+    let scaled = input_tokens_len
+        .saturating_mul(OUTPUT_TOKENS_RATIO_NUM)
+        .saturating_add(OUTPUT_TOKENS_RATIO_DEN.saturating_sub(1))
+        / OUTPUT_TOKENS_RATIO_DEN;
+    let estimated = scaled.saturating_add(OUTPUT_TOKENS_PADDING);
+    let clamped = estimated.clamp(MIN_OUTPUT_TOKENS, MAX_OUTPUT_TOKENS);
+    bucket_output_tokens(clamped)
+}
+
+fn bucket_output_tokens(output_tokens: usize) -> usize {
+    for bucket in OUTPUT_TOKENS_BUCKETS {
+        if output_tokens <= bucket {
+            return bucket;
+        }
+    }
+
+    MAX_OUTPUT_TOKENS
 }
 
 fn is_single_word_input(text: &str) -> bool {
